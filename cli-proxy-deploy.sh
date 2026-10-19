@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================
-#  CLIProxyAPI 一键部署脚本（全自动版）
+#  CLIProxyAPI 一键部署脚本（原生二进制版 · 无 Docker）
 # -------------------------------------------------------------
-#  作用：在 Linux 服务器上以 Docker 方式部署 CLIProxyAPI，
-#        把已有订阅账号的额度统一包装成标准 OpenAI 兼容 API
-#        （默认监听 8317，可被任意支持自定义 base_url 的客户端调用）
+#  作用：在 Linux 服务器上以**原生二进制 + systemd** 方式部署
+#        CLIProxyAPI，把已有订阅账号的额度统一包装成标准
+#        OpenAI 兼容 API（默认监听 8317，可被任意支持自定义
+#        base_url 的客户端调用）。
 #
-#  本版自动化范围（无需任何手工步骤）：
-#    - 自动安装缺失的 Docker
-#    - 自动检测 Caddy：已装则复用；未装则 apt 安装；apt 失败
-#      自动改用官方静态二进制，并自动写好 systemd 服务 + 开机自启
+#  本版特点（相比旧版彻底去掉 Docker 依赖，最省内存）：
+#    - CLIProxyAPI 直接作为宿主机 systemd 服务运行，不拉镜像、
+#      不装 Docker 守护进程，零容器开销
+#    - Caddy 使用官方静态二进制安装（不走 apt、不进容器），
+#      并自动写好 systemd 服务 + 开机自启
 #    - 自动在 Caddyfile 中插入带标记的配置块（不破坏已有站点）
 #    - 写入前备份 + `caddy validate` 校验，校验失败自动回滚
 #    - 自动重载/启动 Caddy
@@ -34,30 +36,28 @@
 set -euo pipefail
 
 PERSIST_DIR="${PERSIST_DIR:-/opt/cliproxy}"
-IMAGE="${IMAGE:-eceasy/cli-proxy-api:latest}"
 API_PORT="${API_PORT:-8317}"
-CONTAINER="cli-proxy-api"
 CONFIG_FILE="$PERSIST_DIR/config.yaml"
 STATE_FILE="$PERSIST_DIR/.deploy.env"
 CADDYFILE_DEFAULT="/etc/caddy/Caddyfile"
-# OAuth 回调端口(Gemini=8085/Codex=1455/Claude=54545/Antigravity=51121/iFlow=11451/xAI=56121)
-MGMT_PORTS=(8085 1455 54545 51121 11451 56121)
+
+# CLIProxyAPI 版本与安装落点（原生二进制）
+CLI_VERSION="${CLI_VERSION:-8.0.33}"
+CLI_BIN="${CLI_BIN:-/usr/local/bin/CLIProxyAPI}"
+CLI_UNIT="/etc/systemd/system/cliproxy-api.service"
+
+# Caddy 运行形态：native=宿主机二进制 | none=未安装
+CADDY_MODE="${CADDY_MODE:-}"
+CADDY_PLAIN="${CADDY_PLAIN:-}"
+CADDY_USER="${CADDY_USER:-admin}"
+API_TOKEN="${API_TOKEN:-}"
+MGMT_SECRET="${MGMT_SECRET:-}"
 
 CF_DOMAIN="${CF_DOMAIN:-}"
 GCP_PUBLIC_IP="${GCP_PUBLIC_IP:-}"
 USE_CADDY="${USE_CADDY:-0}"
 CERT_MODE="${CERT_MODE:-cf}"          # cf=内部自签 | le=Let's Encrypt
 CF_IPS_ONLY="${CF_IPS_ONLY:-1}"       # 1=防火墙只放行 Cloudflare 回源段
-CADDY_PLAIN="${CADDY_PLAIN:-}"
-CADDY_USER="${CADDY_USER:-admin}"
-API_TOKEN="${API_TOKEN:-}"
-MGMT_SECRET="${MGMT_SECRET:-}"
-# Caddy 运行形态：native=宿主机进程 | docker=已有容器 | none=未安装
-# docker 模式下额外记录容器名与 Caddyfile 的宿主机/容器内路径
-CADDY_MODE="${CADDY_MODE:-}"
-CADDY_CONTAINER="${CADDY_CONTAINER:-}"
-CADDY_CONF_HOST="${CADDY_CONF_HOST:-}"
-CADDY_CONF_CONT="${CADDY_CONF_CONT:-}"
 
 # ---------- 通用工具 ----------
 # /dev/tty 存在不代表能打开（容器里常见），必须实测可读
@@ -139,6 +139,18 @@ need_python3(){
   info "python3 已安装： $(python3 --version 2>&1)"
 }
 
+# 探测 CPU 架构，返回 CLIProxyAPI 发布包用的后缀
+#   x86_64/amd64  -> amd64
+#   aarch64/arm64 -> aarch64   （注意：官方文件名用 aarch64）
+cli_arch(){
+  local a; a="$(uname -m)"
+  case "$a" in
+    x86_64|amd64)  printf 'amd64' ;;
+    aarch64|arm64) printf 'aarch64' ;;
+    *) err "不支持的架构： $a（仅支持 amd64 / aarch64）"; return 1 ;;
+  esac
+}
+
 # ---------- 状态持久化 ----------
 save_state(){
   mkdir -p "$PERSIST_DIR"
@@ -151,13 +163,11 @@ USE_CADDY="$USE_CADDY"
 CERT_MODE="$CERT_MODE"
 CF_IPS_ONLY="$CF_IPS_ONLY"
 CADDY_MODE="$CADDY_MODE"
-CADDY_CONTAINER="$CADDY_CONTAINER"
-CADDY_CONF_HOST="$CADDY_CONF_HOST"
-CADDY_CONF_CONT="$CADDY_CONF_CONT"
 CADDY_PLAIN="$CADDY_PLAIN"
 CADDY_USER="$CADDY_USER"
 API_TOKEN="$API_TOKEN"
 MGMT_SECRET="$MGMT_SECRET"
+CLI_VERSION="$CLI_VERSION"
 EOF
   )
   chmod 600 "$STATE_FILE" 2>/dev/null || true
@@ -185,37 +195,11 @@ load_token(){
   return 0
 }
 
-# docker0 网桥地址（宿主机在容器网络里的身份）
-docker0_ip(){ ip -4 addr show docker0 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1 || true; }
-
-# Caddy 容器是否用 host 网络（是则它能看到宿主机 127.0.0.1）
-caddy_is_host_net(){
-  [[ "${CADDY_MODE:-}" == "docker" ]] || return 1
-  [[ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CADDY_CONTAINER" 2>/dev/null || true)" == "host" ]]
-}
-
-# 容器 8317 绑定地址：
-#   native Caddy / host 网络的 Caddy → 只绑 127.0.0.1
-#   bridge 网络的 Caddy 容器 → 绑 docker0 网关（容器内才够得着，公网仍不可达）
-#   不用 Caddy → 0.0.0.0
-bind_addr(){
-  if [[ "${USE_CADDY:-0}" != "1" ]]; then echo "0.0.0.0"; return 0; fi
-  if [[ "${CADDY_MODE:-}" == "docker" ]] && ! caddy_is_host_net; then
-    local gw; gw="$(docker0_ip)"
-    if [[ -n "$gw" ]]; then echo "$gw"; else echo "0.0.0.0"; fi
-    return 0
-  fi
-  echo "127.0.0.1"
-}
-
-# 反代目标主机（从 Caddy 的视角看 CLIProxyAPI 在哪）
-caddy_upstream(){
-  if [[ "${CADDY_MODE:-}" == "docker" ]] && ! caddy_is_host_net; then
-    local gw; gw="$(docker0_ip)"
-    printf '%s' "${gw:-host.docker.internal}"
-    return 0
-  fi
-  printf '127.0.0.1'
+# CLIProxyAPI 监听地址（写进 config.yaml 的 server.host）
+#   启用 Caddy 反代 → 只绑 127.0.0.1（仅本机 Caddy 够得着，公网不可直连）
+#   不用 Caddy     → 0.0.0.0（直接对外）
+cli_bind_host(){
+  if [[ "${USE_CADDY:-0}" == "1" ]]; then echo "127.0.0.1"; else echo "0.0.0.0"; fi
 }
 
 public_ip(){
@@ -278,40 +262,76 @@ show_info(){
   fi
   echo "---------------------------------------------------------"
   echo " 凭据文件: $STATE_FILE （权限 600，含本页全部明文凭据）"
+  echo " 服务形态: CLIProxyAPI 原生 systemd 服务（无 Docker）"
   echo "========================================================="
 }
 
-# ---------- Docker ----------
-ensure_docker(){
-  if ! command -v docker >/dev/null 2>&1; then
-    warn "未检测到 Docker，开始自动安装（get.docker.com）..."
-    curl -fsSL https://get.docker.com | sh || {
-      err "Docker 自动安装失败，请手动执行： curl -fsSL https://get.docker.com | sh"
-      exit 1
-    }
+# ---------- CLIProxyAPI 原生二进制 ----------
+# 下载官方预编译单文件二进制并安装到 /usr/local/bin
+download_cliproxy_binary(){
+  local ver="${CLI_VERSION:-8.0.33}"
+  local arch; arch="$(cli_arch)" || return 1
+  local url="https://github.com/router-for-me/CLIProxyAPI/releases/download/v${ver}/CLIProxyAPI_${ver}_linux_${arch}.tar.gz"
+  local tmp; tmp="$(mktemp -d)"
+  info "下载 CLIProxyAPI v${ver}（arch=${arch}）..."
+  if ! curl -fsSL --max-time 180 "$url" -o "$tmp/cli.tar.gz"; then
+    err "下载失败： $url"
+    err "请检查网络，或手动下载后放到 $CLI_BIN 并重跑 install"
+    rm -rf "$tmp"; return 1
   fi
-  if ! docker info >/dev/null 2>&1; then
-    systemctl enable --now docker >/dev/null 2>&1 || true
-    sleep 2
-    docker info >/dev/null 2>&1 || { err "Docker 未运行，请检查： systemctl status docker"; exit 1; }
+  if ! tar -xzf "$tmp/cli.tar.gz" -C "$tmp"; then
+    err "压缩包解压失败，可能下载被截断"
+    rm -rf "$tmp"; return 1
   fi
-  info "Docker 就绪： $(docker --version 2>/dev/null)"
+  # 容错：发布包内二进制名可能是 CLIProxyAPI / cli-proxy-api，挑第一个可执行文件
+  local bin
+  bin="$(find "$tmp" -type f \( -name 'CLIProxyAPI' -o -name 'cli-proxy-api' \) 2>/dev/null | head -1)"
+  [[ -z "$bin" ]] && bin="$(find "$tmp" -type f -perm -u+x 2>/dev/null | head -1)"
+  if [[ -z "$bin" ]]; then
+    err "压缩包内未找到 CLIProxyAPI 二进制"
+    rm -rf "$tmp"; return 1
+  fi
+  install -m 0755 "$bin" "$CLI_BIN"
+  rm -rf "$tmp"
+  info "CLIProxyAPI 已安装： $CLI_BIN"
+  return 0
 }
 
-run_container(){
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  local mgmt_map="" baddr p
-  baddr="$(bind_addr)"
-  for p in "${MGMT_PORTS[@]}"; do mgmt_map="$mgmt_map -p 127.0.0.1:$p:$p"; done
-  # shellcheck disable=SC2086
-  docker run -d --name "$CONTAINER" --restart unless-stopped \
-    --memory 512m \
-    -p "$baddr:$API_PORT:$API_PORT" \
-    $mgmt_map \
-    -v "$CONFIG_FILE:/CLIProxyAPI/config.yaml" \
-    -v "$PERSIST_DIR/auths:/root/.cli-proxy-api" \
-    -v "$PERSIST_DIR/logs:/CLIProxyAPI/logs" \
-    "$IMAGE" >/dev/null
+# 写 systemd 单元（原生服务，不依赖 Docker）
+install_cliproxy_unit(){
+  mkdir -p "$PERSIST_DIR"/{auths,logs}
+  cat > "$CLI_UNIT" <<UNIT
+[Unit]
+Description=CLIProxyAPI (native, no docker)
+Documentation=https://github.com/router-for-me/CLIProxyAPI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$CLI_BIN -config $CONFIG_FILE
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+LimitNOFILE=1048576
+WorkingDirectory=$PERSIST_DIR
+# 把登录态/缓存目录固定到 PERSIST_DIR 下，等价于旧版的 auths 挂载
+Environment=HOME=$PERSIST_DIR
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  info "已写入 systemd 服务 $CLI_UNIT"
+}
+
+svc_cliproxy(){
+  local act="$1"
+  if ! systemctl list-unit-files --type=service 2>/dev/null | grep -q '^cliproxy-api\.service'; then
+    err "服务 cliproxy-api 未安装，请先执行 install"
+    return 1
+  fi
+  systemctl "$act" cliproxy-api >/dev/null 2>&1 && return 0 || return 1
 }
 
 wait_api(){
@@ -326,7 +346,7 @@ wait_api(){
     fi
     sleep 1
   done
-  warn "等待超时，请查看日志： docker logs $CONTAINER --tail 50"
+  warn "等待超时，请查看日志： journalctl -u cliproxy-api --tail 50"
   return 0
 }
 
@@ -415,7 +435,7 @@ do_firewall(){
   return 0
 }
 
-# ---------- Caddy ----------
+# ---------- Caddy（官方静态二进制，无 Docker） ----------
 install_caddy_unit(){
   [[ -f /etc/systemd/system/caddy.service ]] && return 0
   mkdir -p /etc/caddy
@@ -444,102 +464,31 @@ UNIT
   info "已写入 systemd 服务 /etc/systemd/system/caddy.service"
 }
 
-# 在 Docker 里找 Caddy 容器挂载的 Caddyfile，定位宿主机路径与容器内路径
-resolve_docker_caddyfile(){
-  local c="$1" m type src dst
-  m="$(docker inspect -f '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$c" 2>/dev/null || true)"
-  [[ -z "$m" ]] && return 1
-  # ① 直接挂了 Caddyfile 文件
-  while IFS='|' read -r type src dst; do
-    [[ -z "$dst" ]] && continue
-    if [[ "$dst" == *Caddyfile* && -n "$src" ]]; then
-      CADDY_CONF_HOST="$src"; CADDY_CONF_CONT="$dst"; return 0
-    fi
-  done <<< "$m"
-  # ② 挂了 /etc/caddy 目录
-  while IFS='|' read -r type src dst; do
-    [[ -z "$dst" ]] && continue
-    if [[ "$dst" == "/etc/caddy" || "$dst" == "/etc/caddy/" ]]; then
-      CADDY_CONF_HOST="${src%/}/Caddyfile"; CADDY_CONF_CONT="/etc/caddy/Caddyfile"; return 0
-    fi
-  done <<< "$m"
-  return 1
-}
-
-# 探测 Caddy 形态：优先复用 Docker 容器，其次宿主机二进制，最后 none
+# 探测 Caddy 形态：仅复用宿主机二进制，否则记为 none
 detect_caddy(){
-  # 沿用上次记录的容器（还活着就直接用，避免同一个 Caddyfile 被认成别的）
-  if [[ "${CADDY_MODE:-}" == "docker" && -n "${CADDY_CONTAINER:-}" ]]; then
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CADDY_CONTAINER"; then
-      return 0
-    fi
-    warn "上次复用的 Caddy 容器 $CADDY_CONTAINER 已不存在，重新探测"
-    CADDY_MODE=""; CADDY_CONTAINER=""; CADDY_CONF_HOST=""; CADDY_CONF_CONT=""
-  fi
-
-  if command -v docker >/dev/null 2>&1; then
-    local line name
-    line="$(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null | grep -i caddy | head -1 || true)"
-    if [[ -n "$line" ]]; then
-      name="${line%%|*}"
-      if resolve_docker_caddyfile "$name"; then
-        CADDY_MODE="docker"; CADDY_CONTAINER="$name"
-        return 0
-      fi
-      if [[ "${_CADDY_WARNED:-0}" != "1" ]]; then
-        warn "发现 Caddy 容器 $name，但它没有挂载 Caddyfile，无法安全复用"
-        warn "  可改用 IP 直连，或给容器加上 -v /etc/caddy/Caddyfile:/etc/caddy/Caddyfile 后重跑"
-        _CADDY_WARNED=1
-      fi
-    fi
-  fi
-
   if command -v caddy >/dev/null 2>&1; then
-    CADDY_MODE="native"; CADDY_CONTAINER=""; CADDY_CONF_HOST=""; CADDY_CONF_CONT=""
-    return 0
+    CADDY_MODE="native"; return 0
   fi
-
   CADDY_MODE="none"; return 0
 }
 
-# 统一的 Caddy 操作入口：docker 模式走 docker exec
 caddy_validate(){
-  local site="$1"
-  if [[ "${CADDY_MODE:-}" == "docker" ]]; then
-    docker exec "$CADDY_CONTAINER" caddy validate --config "$CADDY_CONF_CONT" --adapter caddyfile >/dev/null 2>&1
-  else
-    caddy validate --config "$site" >/dev/null 2>&1
-  fi
+  caddy validate --config "$1" >/dev/null 2>&1
 }
 
 caddy_hash(){
-  if [[ "${CADDY_MODE:-}" == "docker" ]]; then
-    docker exec "$CADDY_CONTAINER" caddy hash-password --plaintext "$1" 2>/dev/null
-  else
-    caddy hash-password --plaintext "$1" 2>/dev/null \
-      || printf '%s' "$1" | caddy hash-password 2>/dev/null
-  fi
+  caddy hash-password --plaintext "$1" 2>/dev/null \
+    || printf '%s' "$1" | caddy hash-password 2>/dev/null
 }
 
 ensure_caddy(){
   detect_caddy
-  case "${CADDY_MODE:-none}" in
-    docker)
-      info "复用已有 Caddy 容器： $CADDY_CONTAINER"
-      info "  Caddyfile（宿主机）: $CADDY_CONF_HOST"
-      info "  Caddyfile（容器内）: $CADDY_CONF_CONT"
-      if ! caddy_is_host_net; then
-        info "  容器为 bridge 网络 → 反代目标用 $(caddy_upstream):$API_PORT"
-      fi
-      return 0
-      ;;
-    native)
-      info "已检测到 Caddy： $(command -v caddy)  $(caddy version 2>/dev/null | head -1)"
-      return 0
-      ;;
-  esac
+  if [[ "${CADDY_MODE:-none}" == "native" ]]; then
+    info "已检测到 Caddy： $(command -v caddy)  $(caddy version 2>/dev/null | head -1)"
+    return 0
+  fi
 
-  # 装之前先看 80/443 是否已被别人占着（nginx / 其它容器 / 残留进程）
+  # 装之前先看 80/443 是否已被别人占着（nginx / 其它进程）
   local p
   for p in 80 443; do
     if port_in_use "$p"; then
@@ -550,19 +499,7 @@ ensure_caddy(){
     fi
   done
 
-  warn "未检测到 Caddy（含 Docker 容器），开始自动安装（无需手工操作）"
-
-  if command -v apt-get >/dev/null 2>&1; then
-    info "尝试用 apt 安装 caddy ..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1 || true
-    if apt-get install -y --no-install-recommends caddy >/dev/null 2>&1 && command -v caddy >/dev/null 2>&1; then
-      CADDY_MODE="native"
-      info "apt 安装成功： $(caddy version 2>/dev/null | head -1)"
-      return 0
-    fi
-    warn "apt 安装未成功，改用官方静态二进制"
-  fi
+  warn "未检测到 Caddy，开始自动安装官方静态二进制（无 apt / 无容器，最省内存）"
 
   local arch; arch="$(uname -m)"
   case "$arch" in
@@ -584,9 +521,6 @@ ensure_caddy(){
 }
 
 caddy_conf_path(){
-  if [[ "${CADDY_MODE:-}" == "docker" && -n "${CADDY_CONF_HOST:-}" ]]; then
-    printf '%s' "$CADDY_CONF_HOST"; return 0
-  fi
   local p
   p="$(systemctl cat caddy 2>/dev/null | grep -oE '\-\-config[ =][^ ]+' | head -1 | awk '{print $NF}' || true)"
   if [[ -n "$p" ]]; then printf '%s' "$p"; else printf '%s' "$CADDYFILE_DEFAULT"; fi
@@ -594,16 +528,6 @@ caddy_conf_path(){
 
 restart_caddy(){
   local site="$1"
-  if [[ "${CADDY_MODE:-}" == "docker" ]]; then
-    if docker exec "$CADDY_CONTAINER" caddy reload --config "$CADDY_CONF_CONT" --adapter caddyfile >/dev/null 2>&1; then
-      info "Caddy 容器已重载（$CADDY_CONTAINER）"; return 0
-    fi
-    if docker restart "$CADDY_CONTAINER" >/dev/null 2>&1; then
-      info "Caddy 容器已重启（$CADDY_CONTAINER）"; return 0
-    fi
-    warn "Caddy 容器重载失败，请手动检查： docker logs $CADDY_CONTAINER --tail 30"
-    return 0
-  fi
   if [[ -d /run/systemd/system ]] && systemctl list-unit-files --type=service 2>/dev/null | grep -q '^caddy\.service'; then
     systemctl enable caddy >/dev/null 2>&1 || true
     if systemctl is-active --quiet caddy; then
@@ -645,11 +569,8 @@ setup_caddy(){
     warn "密码哈希生成失败 —— 管理面板将不设 Basic 认证，仅靠 management.secret-key 保护"
   fi
 
-  local up; up="$(caddy_upstream)"
-  if [[ "$up" != "127.0.0.1" ]]; then
-    info "反代目标： $up:$API_PORT（Caddy 在容器里，不能用 127.0.0.1）"
-  fi
-
+  # 原生 Caddy 与 CLIProxyAPI 同机，反代目标恒为 127.0.0.1
+  local up="127.0.0.1"
   local start_marker='# >>> CLIProxyAPI START'
   local end_marker='# >>> CLIProxyAPI END'
   local auth_block="" block=""
@@ -733,16 +654,24 @@ PY
   restart_caddy "$site"
 }
 
-# ---------- 安装 ----------
+# ---------- 配置 ----------
 write_config(){
   if [[ -d "$CONFIG_FILE" ]]; then
-    warn "发现 $CONFIG_FILE 是目录(Docker 挂载陷阱)，已删除重建"
+    warn "发现 $CONFIG_FILE 是目录，已删除重建"
     rm -rf "$CONFIG_FILE"
   fi
 
+  local host; host="$(cli_bind_host)"
+
   if [[ -f "$CONFIG_FILE" ]]; then
+    # 已有配置：保留原密钥，仅修正 allow-remote 与监听地址
     sed -i -E 's/(allow-remote:[[:space:]]*)(true|false)/\1true/' "$CONFIG_FILE" 2>/dev/null || true
-    info "已有 config.yaml，保留原密钥，仅修正 allow-remote=true"
+    if grep -qE '^[[:space:]]*host:' "$CONFIG_FILE"; then
+      sed -i -E "s/^([[:space:]]*host:[[:space:]]*).*/\1\"$host\"/" "$CONFIG_FILE" 2>/dev/null || true
+    else
+      sed -i -E "/^[[:space:]]*server:/a\\  host: \"$host\"" "$CONFIG_FILE" 2>/dev/null || true
+    fi
+    info "已有 config.yaml，保留原密钥，仅修正 allow-remote=true 与 host=$host"
     load_token
     if [[ -z "${MGMT_SECRET:-}" ]]; then
       # 兼容两种写法：带引号的明文，以及 CLIProxyAPI 回写的无引号 bcrypt 哈希
@@ -767,10 +696,10 @@ write_config(){
     cat > "$CONFIG_FILE" <<EOF
 config-version: 8
 server:
-  host: ""              # 空 = 监听所有接口（容器内必须如此）
+  host: "$host"         # 启用 Caddy 反代时绑 127.0.0.1；直连时绑 0.0.0.0
   port: $API_PORT
 management:
-  allow-remote: true    # Docker 网桥下必须 true，否则管理后台 403
+  allow-remote: true    # 反代 / NAT 下必须 true，否则管理后台 403
   secret-key: "$MGMT_SECRET"
   disable-control-panel: false
 access:
@@ -778,7 +707,7 @@ access:
     - "$API_TOKEN"
 EOF
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-    info "已写入 $CONFIG_FILE"
+    info "已写入 $CONFIG_FILE（host=$host）"
   fi
 }
 
@@ -805,7 +734,6 @@ ask_credentials(){
 do_install(){
   need_root "$@"
   need_python3
-  ensure_docker
 
   mkdir -p "$PERSIST_DIR"/{auths,logs}
   load_state
@@ -844,34 +772,33 @@ do_install(){
 
   # 先定下 Caddy 形态：它决定 8317 绑哪里、反代目标填什么地址
   if [[ "$USE_CADDY" == "1" ]]; then
-    detect_caddy
-    case "${CADDY_MODE:-none}" in
-      docker) info "将复用 Docker 里的 Caddy 容器： $CADDY_CONTAINER" ;;
-      native) info "将复用宿主机 Caddy： $(command -v caddy)" ;;
-      *)      info "未发现 Caddy，稍后自动安装" ;;
-    esac
+    ensure_caddy
+    info "将使用宿主机 Caddy： $(command -v caddy 2>/dev/null || echo '(即将安装)')"
   fi
 
   save_state
   write_config
 
-  if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    if port_in_use "$API_PORT"; then
-      err "端口 $API_PORT 已被其他进程占用，请先释放： ss -ltnp | grep :$API_PORT"
-      exit 1
-    fi
+  # 端口守卫
+  if port_in_use "$API_PORT"; then
+    err "端口 $API_PORT 已被其他进程占用，请先释放： ss -ltnp | grep :$API_PORT"
+    exit 1
   fi
 
-  run_container
+  # 安装并启动 CLIProxyAPI（原生二进制 + systemd，无 Docker）
+  download_cliproxy_binary || exit 1
+  install_cliproxy_unit
+  systemctl enable --now cliproxy-api >/dev/null 2>&1 || true
   wait_api
 
   if [[ "$USE_CADDY" == "1" ]]; then
     setup_caddy || true
-    # setup_caddy 失败时内部会把 USE_CADDY 置 0，此时容器还绑着 127.0.0.1，
-    # 必须重新 run 一次改成 0.0.0.0，否则外部根本连不上
+    # setup_caddy 失败时内部会把 USE_CADDY 置 0，此时服务还绑着 127.0.0.1，
+    # 必须重新写 host=0.0.0.0 并重启服务，否则外部根本连不上
     if [[ "$USE_CADDY" != "1" ]]; then
-      warn "已回退 IP 直连，重新绑定 0.0.0.0 并重启容器"
-      run_container
+      warn "已回退 IP 直连，重新绑定 0.0.0.0 并重启服务"
+      write_config
+      systemctl restart cliproxy-api >/dev/null 2>&1 || true
       wait_api
     fi
   fi
@@ -882,36 +809,24 @@ do_install(){
 
 # ---------- 运行控制 ----------
 do_start(){
-  if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    docker start "$CONTAINER" >/dev/null && info "已启动"
-  else
-    err "容器不存在，请先执行 install"
-  fi
+  if svc_cliproxy start; then info "已启动"; else err "启动失败，看日志： journalctl -u cliproxy-api --tail 50"; fi
 }
 
 do_stop(){
-  docker stop "$CONTAINER" >/dev/null 2>&1 && info "已停止" || warn "未运行"
+  if svc_cliproxy stop; then info "已停止"; else warn "未运行"; fi
 }
 
 do_restart(){
-  if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    docker restart "$CONTAINER" >/dev/null && info "已重启"
-  else
-    err "容器不存在，请先执行 install"
-  fi
+  if svc_cliproxy restart; then info "已重启"; else err "重启失败，看日志： journalctl -u cliproxy-api --tail 50"; fi
 }
 
 do_status(){
   load_state
-  if ! command -v docker >/dev/null 2>&1; then
-    err "未检测到 docker，请先执行 install"
-    return 1
+  if ! systemctl is-active --quiet cliproxy-api; then
+    warn "服务 cliproxy-api 未运行（用 start 启动）"
+  else
+    info "服务 cliproxy-api 正在运行（$(cli_bind_host) :$API_PORT）"
   fi
-  if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    warn "容器 $CONTAINER 未运行（用 start 启动）"
-    return 0
-  fi
-  info "容器 $CONTAINER 正在运行（$API_PORT 绑定 $(bind_addr)）"
   load_token
 
   local code
@@ -926,18 +841,12 @@ do_status(){
       | python3 -c "import sys,json;d=json.load(sys.stdin);[print('      -',m['id']) for m in d.get('data',[])]" 2>/dev/null \
       || echo "      (模型列表解析失败，可在管理面板查看)"
   else
-    warn "API 健康检查返回 $code（看日志： docker logs $CONTAINER --tail 30）"
+    warn "API 健康检查返回 $code（看日志： journalctl -u cliproxy-api --tail 30）"
   fi
 
   if [[ "${USE_CADDY:-0}" == "1" ]]; then
-    if [[ "${CADDY_MODE:-}" == "docker" ]]; then
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CADDY_CONTAINER"; then
-        info "Caddy 容器运行中： $CADDY_CONTAINER（反代 → $(caddy_upstream):$API_PORT）"
-      else
-        warn "Caddy 容器 $CADDY_CONTAINER 未运行"
-      fi
-    elif [[ -d /run/systemd/system ]] && systemctl is-active --quiet caddy; then
-      info "Caddy 运行中： $(caddy version 2>/dev/null | head -1)"
+    if [[ -d /run/systemd/system ]] && systemctl is-active --quiet caddy; then
+      info "Caddy 运行中： $(caddy version 2>/dev/null | head -1)（反代 → 127.0.0.1:$API_PORT）"
     else
       warn "Caddy 未作为 systemd 服务运行，重启机器后可能失效"
     fi
@@ -946,23 +855,29 @@ do_status(){
 }
 
 do_logs(){
-  docker logs --tail 100 "$CONTAINER" 2>&1 || warn "无日志（可能尚未运行）"
+  if [[ -d /run/systemd/system ]] && systemctl list-unit-files --type=service 2>/dev/null | grep -q '^cliproxy-api\.service'; then
+    journalctl -u cliproxy-api -n 100 --no-pager 2>&1 || warn "无日志（可能尚未运行）"
+  else
+    warn "未以 systemd 安装，日志路径： $PERSIST_DIR/logs"
+  fi
 }
 
 do_update(){
   need_root "$@"
   load_state
-  info "拉取最新镜像 $IMAGE ..."
-  docker pull "$IMAGE" >/dev/null 2>&1 || warn "拉取失败，使用现有镜像"
+  info "拉取最新 CLIProxyAPI 二进制（v${CLI_VERSION:-8.0.33}）..."
+  download_cliproxy_binary || warn "下载失败，继续使用现有二进制"
+  install_cliproxy_unit
+  systemctl restart cliproxy-api >/dev/null 2>&1 || true
   if [[ "${USE_CADDY:-0}" == "1" ]]; then
-    detect_caddy
+    ensure_caddy
   fi
-  run_container
   if [[ "${USE_CADDY:-0}" == "1" && -n "$CF_DOMAIN" ]]; then
     setup_caddy || true
     if [[ "$USE_CADDY" != "1" ]]; then
       warn "Caddy 异常，已回退 IP 直连并重新绑定 0.0.0.0"
-      run_container
+      write_config
+      systemctl restart cliproxy-api >/dev/null 2>&1 || true
       wait_api
     fi
   fi
@@ -973,8 +888,12 @@ do_update(){
 do_uninstall(){
   need_root "$@"
   load_state
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  info "容器已移除"
+
+  systemctl stop cliproxy-api >/dev/null 2>&1 || true
+  systemctl disable cliproxy-api >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/cliproxy-api.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  info "CLIProxyAPI 服务已移除（未删除二进制 $CLI_BIN，可留作他用）"
 
   if [[ "${USE_CADDY:-0}" == "1" ]]; then
     remove_caddy_block || true
@@ -988,13 +907,13 @@ do_uninstall(){
   else
     info "保留配置目录 $PERSIST_DIR"
   fi
-  info "Caddy 本体未卸载（可能还有其它站点在用）。如需卸载： apt remove caddy"
+  info "Caddy 本体未卸载（可能还有其它站点在用）。如需卸载： rm -f /usr/local/bin/caddy /etc/systemd/system/caddy.service"
 }
 
 show_menu(){
   while true; do
     echo
-    echo "====== CLIProxyAPI 管理菜单 ======"
+    echo "====== CLIProxyAPI 管理菜单（原生二进制版）======"
     echo " 1) 安装/重建 install"
     echo " 2) 启动 start"
     echo " 3) 停止 stop"
@@ -1004,7 +923,7 @@ show_menu(){
     echo " 7) 更新 update"
     echo " 8) 卸载 uninstall"
     echo " 0) 退出"
-    echo "=================================="
+    echo "================================================="
     local sel; sel="$(_ask '请选择 [0-8]: ')"
     case "$sel" in
       1) do_install ;;
@@ -1024,21 +943,21 @@ show_menu(){
 # ---------- 入口 ----------
 usage(){
   cat <<'EOF'
-CLIProxyAPI 一键部署脚本
+CLIProxyAPI 一键部署脚本（原生二进制版 · 无 Docker）
 
 用法:
   bash cli-proxy-deploy.sh [子命令]
 
 子命令:
   (无)        有终端时进入管理菜单，无终端时等同 install
-  install     安装或重建（自动装 Docker / 写配置 / 起容器 / 配 Caddy / 放行防火墙）
-  start       启动容器
-  stop        停止容器
-  restart     重启容器
+  install     安装或重建（下载二进制 / 写配置 / 起 systemd 服务 / 配 Caddy / 放行防火墙）
+  start       启动服务
+  stop        停止服务
+  restart     重启服务
   status      查看状态、可用模型与全部凭据
-  logs        查看最近 100 行日志
-  update      拉取最新镜像并重启（复用已有凭据与网络模式）
-  uninstall   卸载容器（可选是否删除配置目录）
+  logs        查看最近 100 行日志（journalctl）
+  update      重新下载最新二进制并重启（复用已有凭据与网络模式）
+  uninstall   卸载服务（可选是否删除配置目录）
   menu        进入管理菜单
   help        显示本帮助
 
@@ -1050,6 +969,7 @@ CLIProxyAPI 一键部署脚本
   USE_CADDY=1|0            是否启用 Caddy 反代（默认 0）
   CERT_MODE=cf|le          cf=内部自签(适配 Cloudflare 橙云) | le=Let's Encrypt
   CF_IPS_ONLY=1|0          防火墙是否只放行 Cloudflare 回源段
+  CLI_VERSION=8.0.33       CLIProxyAPI 版本（决定下载哪个 release）
   API_PORT=8317            服务端口
   PERSIST_DIR=/opt/cliproxy 配置与登录态目录
 
