@@ -1,0 +1,6 @@
+# 本地备份/临时文件，不入库
+*.orig
+*.bak
+*.bak.*
+*.swp
+.DS_Store
