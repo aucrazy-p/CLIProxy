@@ -7,7 +7,9 @@
 **一条命令装完，中间只需要回答几个问题，不需要手工改配置文件。**
 
 - 缺 Docker 自动装
+- Caddy 先探测再决定：**已有的（含 Docker 容器）直接复用**，没有才装
 - 缺 Caddy 自动装（apt 优先，失败降级官方静态二进制），自动写 systemd 服务并开机自启
+- 装之前先检查 80/443 是否被占用，被占则明确报错并回退，不会装出一个起不来的服务
 - Caddyfile 用标记块插入，**不会覆盖你已有的其它站点**
 - 写入前备份、写入后 `caddy validate` 校验，校验不过自动回滚并退回 IP 直连
 - 端口、令牌、密钥全部自动生成并落盘
@@ -51,6 +53,49 @@ sudo bash /tmp/cpa.sh
 
 ---
 
+## 已有 Caddy 会不会重复装
+
+不会。脚本按这个顺序探测，**能复用就不装新的**：
+
+| 顺序 | 探测目标 | 命中后 |
+|---|---|---|
+| 1 | Docker 里正在跑的 Caddy 容器 | 复用：改它挂载的 Caddyfile，`docker exec` 校验并 reload |
+| 2 | 宿主机 `caddy` 二进制 | 复用：改 `/etc/caddy/Caddyfile`，走 systemd reload |
+| 3 | 都没有 | 安装（装前先检查 80/443 是否被占用） |
+
+### Docker 版复用需要注意的两件事
+
+**① 容器必须挂载了 Caddyfile。** 脚本靠 `docker inspect` 找挂载点，识别这两种写法：
+
+```bash
+-v /opt/caddy/Caddyfile:/etc/caddy/Caddyfile   # 推荐
+-v /opt/caddy:/etc/caddy                       # 也认，取其中的 Caddyfile
+```
+
+如果配置是打进镜像的（没挂载），脚本**不会**去动它——改了重启就丢，不如不碰。这种情况会提示你，然后回退到 IP 直连。
+
+**② 反代地址会自动换。** 容器里的 `127.0.0.1` 是容器自己，不是宿主机。所以脚本会：
+
+- 反代目标从 `127.0.0.1:8317` 自动换成 **docker0 网关**（通常是 `172.17.0.1:8317`）
+- 8317 也随之绑到这个网关地址而不是 `0.0.0.0`，公网依旧访问不到，只有本机容器能连
+
+如果 Caddy 容器用的是 `--network host`，则仍用 `127.0.0.1`，不做替换。
+
+> 复用的容器得自己已经发布了 80/443（`-p 80:80 -p 443:443`），否则 Cloudflare 过来的流量进不来——这属于你原容器的配置，脚本不去改。
+
+### 80/443 已被占用
+
+脚本会直接报错并列出占用者：
+
+```
+✗ 端口 80 已被占用，此时装 Caddy 会起不来
+LISTEN 0  511  0.0.0.0:80  0.0.0.0:*
+```
+
+此时要么释放端口，要么让占用方自己反代到 `127.0.0.1:8317`，脚本这边选①留空域名、②填 `0` 走 IP 直连即可。
+
+---
+
 ## 凭据是怎么处理的
 
 三个凭据默认都是**安装时自动生成的 32 位随机串**（`openssl rand -hex 16`），也可以自己指定。它们互相独立，改一个不影响另一个。
@@ -58,10 +103,19 @@ sudo bash /tmp/cpa.sh
 | 凭据 | 用途 | 存放位置 | 生成后还能看到明文吗 |
 |---|---|---|---|
 | `API_TOKEN` | 客户端调 `/v1/*` 时的 `Authorization: Bearer` | `config.yaml` 的 `access.api-keys` | 能，明文一直在 |
-| `MGMT_SECRET` | 管理面板 `management.html` 的登录密钥 | `config.yaml` 的 `management.secret-key` | **首次启动后不能**，会被 CLIProxyAPI 改写成 bcrypt 哈希 |
+| `MGMT_SECRET` | 管理面板 `management.html` 的登录密钥 | `config.yaml` 的 `management.secret-key`（启动后被 hash）；明文另存 `.deploy.env` | Caddyfile/config 里都看不到明文，去 `.deploy.env` 或 `status` 输出里找 |
 | `CADDY_PLAIN` | 浏览器访问后台时的 Basic 认证密码 | 明文只在 `.deploy.env`；Caddyfile 里是哈希 | 能，从 `.deploy.env` 读 |
 
 明文凭据统一落在 `/opt/cliproxy/.deploy.env`（权限 `600`，仅 root 可读），安装结束和每次 `status` 都会打印。
+
+**`MGMT_SECRET` 就是管理面板的登录密码。** 打开 `management.html`，输入框里要填的就是它。
+
+如果启用了 Caddy 反代，访问后台其实是**两层**：
+
+1. 浏览器先弹 Basic 认证框 → 账号 `admin`、密码 `CADDY_PLAIN`（Caddy 挡在门口）
+2. 通过后才看到 CLIProxyAPI 自己的登录页 → 输入 `MGMT_SECRET`
+
+两个密码互相独立，换一个不影响另一个。只从本机 `http://127.0.0.1:8317/management.html` 访问时没有第 1 层，直接输 `MGMT_SECRET`。
 
 ### 三种指定方式
 
@@ -179,6 +233,9 @@ gcloud compute firewall-rules create allow-cliproxy-8317 \
 **Caddy 装在非 systemd 环境的容器里？**
 脚本会退化成 `caddy start` 后台进程，机器重启后不会自动拉起来，需要重跑一次 `install`。
 
+**VPS 上已经有 Docker 版 Caddy，会不会被重复装一个？**
+不会。脚本先找容器，找到且挂了 Caddyfile 就直接复用，不会装第二个——两个 Caddy 抢 80/443 会直接起不来。容器没挂 Caddyfile 时它会提示并回退 IP 直连，不会悄悄改镜像内的配置。详见上文「已有 Caddy 会不会重复装」。
+
 **卸载会不会连 Caddy 一起删？**
 不会。Caddy 可能还跑着别的站点，只清理本脚本写入的配置块。确实要卸载 Caddy：`apt remove caddy`。
 
@@ -192,7 +249,7 @@ gcloud compute firewall-rules create allow-cliproxy-8317 \
 - Linux + root
 - `python3`（配置解析与 Caddyfile 写入，脚本会检查并提示安装命令）
 - Docker（缺失自动安装）
-- Caddy（缺失自动安装，仅启用反代时需要）
+- Caddy（可选，仅启用反代时需要）：已有的直接复用（宿主机二进制或 Docker 容器都算），没有才自动安装
 - `gcloud`（可选，仅在 GCP 上自动配防火墙；没有就打印手动放行命令）
 
 ---

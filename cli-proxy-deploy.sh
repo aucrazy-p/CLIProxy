@@ -52,6 +52,12 @@ CADDY_PLAIN="${CADDY_PLAIN:-}"
 CADDY_USER="${CADDY_USER:-admin}"
 API_TOKEN="${API_TOKEN:-}"
 MGMT_SECRET="${MGMT_SECRET:-}"
+# Caddy 运行形态：native=宿主机进程 | docker=已有容器 | none=未安装
+# docker 模式下额外记录容器名与 Caddyfile 的宿主机/容器内路径
+CADDY_MODE="${CADDY_MODE:-}"
+CADDY_CONTAINER="${CADDY_CONTAINER:-}"
+CADDY_CONF_HOST="${CADDY_CONF_HOST:-}"
+CADDY_CONF_CONT="${CADDY_CONF_CONT:-}"
 
 # ---------- 通用工具 ----------
 # /dev/tty 存在不代表能打开（容器里常见），必须实测可读
@@ -126,6 +132,10 @@ CF_DOMAIN="$CF_DOMAIN"
 USE_CADDY="$USE_CADDY"
 CERT_MODE="$CERT_MODE"
 CF_IPS_ONLY="$CF_IPS_ONLY"
+CADDY_MODE="$CADDY_MODE"
+CADDY_CONTAINER="$CADDY_CONTAINER"
+CADDY_CONF_HOST="$CADDY_CONF_HOST"
+CADDY_CONF_CONT="$CADDY_CONF_CONT"
 CADDY_PLAIN="$CADDY_PLAIN"
 CADDY_USER="$CADDY_USER"
 API_TOKEN="$API_TOKEN"
@@ -150,8 +160,38 @@ load_token(){
   return 0
 }
 
-# 容器 8317 绑定地址：启用 Caddy 时只绑 localhost（由 Caddy 反代），否则 0.0.0.0 直连
-bind_addr(){ [[ "${USE_CADDY:-0}" == "1" ]] && echo "127.0.0.1" || echo "0.0.0.0"; }
+# docker0 网桥地址（宿主机在容器网络里的身份）
+docker0_ip(){ ip -4 addr show docker0 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1 || true; }
+
+# Caddy 容器是否用 host 网络（是则它能看到宿主机 127.0.0.1）
+caddy_is_host_net(){
+  [[ "${CADDY_MODE:-}" == "docker" ]] || return 1
+  [[ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CADDY_CONTAINER" 2>/dev/null || true)" == "host" ]]
+}
+
+# 容器 8317 绑定地址：
+#   native Caddy / host 网络的 Caddy → 只绑 127.0.0.1
+#   bridge 网络的 Caddy 容器 → 绑 docker0 网关（容器内才够得着，公网仍不可达）
+#   不用 Caddy → 0.0.0.0
+bind_addr(){
+  if [[ "${USE_CADDY:-0}" != "1" ]]; then echo "0.0.0.0"; return 0; fi
+  if [[ "${CADDY_MODE:-}" == "docker" ]] && ! caddy_is_host_net; then
+    local gw; gw="$(docker0_ip)"
+    if [[ -n "$gw" ]]; then echo "$gw"; else echo "0.0.0.0"; fi
+    return 0
+  fi
+  echo "127.0.0.1"
+}
+
+# 反代目标主机（从 Caddy 的视角看 CLIProxyAPI 在哪）
+caddy_upstream(){
+  if [[ "${CADDY_MODE:-}" == "docker" ]] && ! caddy_is_host_net; then
+    local gw; gw="$(docker0_ip)"
+    printf '%s' "${gw:-host.docker.internal}"
+    return 0
+  fi
+  printf '127.0.0.1'
+}
 
 public_ip(){
   local ip="${GCP_PUBLIC_IP:-}"
@@ -375,19 +415,120 @@ UNIT
   info "已写入 systemd 服务 /etc/systemd/system/caddy.service"
 }
 
-ensure_caddy(){
+# 在 Docker 里找 Caddy 容器挂载的 Caddyfile，定位宿主机路径与容器内路径
+resolve_docker_caddyfile(){
+  local c="$1" m type src dst
+  m="$(docker inspect -f '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$c" 2>/dev/null || true)"
+  [[ -z "$m" ]] && return 1
+  # ① 直接挂了 Caddyfile 文件
+  while IFS='|' read -r type src dst; do
+    [[ -z "$dst" ]] && continue
+    if [[ "$dst" == *Caddyfile* && -n "$src" ]]; then
+      CADDY_CONF_HOST="$src"; CADDY_CONF_CONT="$dst"; return 0
+    fi
+  done <<< "$m"
+  # ② 挂了 /etc/caddy 目录
+  while IFS='|' read -r type src dst; do
+    [[ -z "$dst" ]] && continue
+    if [[ "$dst" == "/etc/caddy" || "$dst" == "/etc/caddy/" ]]; then
+      CADDY_CONF_HOST="${src%/}/Caddyfile"; CADDY_CONF_CONT="/etc/caddy/Caddyfile"; return 0
+    fi
+  done <<< "$m"
+  return 1
+}
+
+# 探测 Caddy 形态：优先复用 Docker 容器，其次宿主机二进制，最后 none
+detect_caddy(){
+  # 沿用上次记录的容器（还活着就直接用，避免同一个 Caddyfile 被认成别的）
+  if [[ "${CADDY_MODE:-}" == "docker" && -n "${CADDY_CONTAINER:-}" ]]; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CADDY_CONTAINER"; then
+      return 0
+    fi
+    warn "上次复用的 Caddy 容器 $CADDY_CONTAINER 已不存在，重新探测"
+    CADDY_MODE=""; CADDY_CONTAINER=""; CADDY_CONF_HOST=""; CADDY_CONF_CONT=""
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    local line name
+    line="$(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null | grep -i caddy | head -1 || true)"
+    if [[ -n "$line" ]]; then
+      name="${line%%|*}"
+      if resolve_docker_caddyfile "$name"; then
+        CADDY_MODE="docker"; CADDY_CONTAINER="$name"
+        return 0
+      fi
+      if [[ "${_CADDY_WARNED:-0}" != "1" ]]; then
+        warn "发现 Caddy 容器 $name，但它没有挂载 Caddyfile，无法安全复用"
+        warn "  可改用 IP 直连，或给容器加上 -v /etc/caddy/Caddyfile:/etc/caddy/Caddyfile 后重跑"
+        _CADDY_WARNED=1
+      fi
+    fi
+  fi
+
   if command -v caddy >/dev/null 2>&1; then
-    info "已检测到 Caddy： $(command -v caddy)  $(caddy version 2>/dev/null | head -1)"
+    CADDY_MODE="native"; CADDY_CONTAINER=""; CADDY_CONF_HOST=""; CADDY_CONF_CONT=""
     return 0
   fi
 
-  warn "未检测到 Caddy，开始自动安装（无需手工操作）"
+  CADDY_MODE="none"; return 0
+}
+
+# 统一的 Caddy 操作入口：docker 模式走 docker exec
+caddy_validate(){
+  local site="$1"
+  if [[ "${CADDY_MODE:-}" == "docker" ]]; then
+    docker exec "$CADDY_CONTAINER" caddy validate --config "$CADDY_CONF_CONT" --adapter caddyfile >/dev/null 2>&1
+  else
+    caddy validate --config "$site" >/dev/null 2>&1
+  fi
+}
+
+caddy_hash(){
+  if [[ "${CADDY_MODE:-}" == "docker" ]]; then
+    docker exec "$CADDY_CONTAINER" caddy hash-password --plaintext "$1" 2>/dev/null
+  else
+    caddy hash-password --plaintext "$1" 2>/dev/null \
+      || printf '%s' "$1" | caddy hash-password 2>/dev/null
+  fi
+}
+
+ensure_caddy(){
+  detect_caddy
+  case "${CADDY_MODE:-none}" in
+    docker)
+      info "复用已有 Caddy 容器： $CADDY_CONTAINER"
+      info "  Caddyfile（宿主机）: $CADDY_CONF_HOST"
+      info "  Caddyfile（容器内）: $CADDY_CONF_CONT"
+      if ! caddy_is_host_net; then
+        info "  容器为 bridge 网络 → 反代目标用 $(caddy_upstream):$API_PORT"
+      fi
+      return 0
+      ;;
+    native)
+      info "已检测到 Caddy： $(command -v caddy)  $(caddy version 2>/dev/null | head -1)"
+      return 0
+      ;;
+  esac
+
+  # 装之前先看 80/443 是否已被别人占着（nginx / 其它容器 / 残留进程）
+  local p
+  for p in 80 443; do
+    if port_in_use "$p"; then
+      err "端口 $p 已被占用，此时装 Caddy 会起不来"
+      ss -ltnp 2>/dev/null | grep -E "[:.]$p[[:space:]]" || true
+      err "请先释放该端口（或让占用方反代到 127.0.0.1:$API_PORT），再重跑 install"
+      return 1
+    fi
+  done
+
+  warn "未检测到 Caddy（含 Docker 容器），开始自动安装（无需手工操作）"
 
   if command -v apt-get >/dev/null 2>&1; then
     info "尝试用 apt 安装 caddy ..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null 2>&1 || true
     if apt-get install -y --no-install-recommends caddy >/dev/null 2>&1 && command -v caddy >/dev/null 2>&1; then
+      CADDY_MODE="native"
       info "apt 安装成功： $(caddy version 2>/dev/null | head -1)"
       return 0
     fi
@@ -408,11 +549,15 @@ ensure_caddy(){
   fi
   chmod +x /usr/local/bin/caddy
   install_caddy_unit
+  CADDY_MODE="native"
   info "Caddy 已安装： $(caddy version 2>/dev/null | head -1)"
   return 0
 }
 
 caddy_conf_path(){
+  if [[ "${CADDY_MODE:-}" == "docker" && -n "${CADDY_CONF_HOST:-}" ]]; then
+    printf '%s' "$CADDY_CONF_HOST"; return 0
+  fi
   local p
   p="$(systemctl cat caddy 2>/dev/null | grep -oE '\-\-config[ =][^ ]+' | head -1 | awk '{print $NF}' || true)"
   if [[ -n "$p" ]]; then printf '%s' "$p"; else printf '%s' "$CADDYFILE_DEFAULT"; fi
@@ -420,6 +565,16 @@ caddy_conf_path(){
 
 restart_caddy(){
   local site="$1"
+  if [[ "${CADDY_MODE:-}" == "docker" ]]; then
+    if docker exec "$CADDY_CONTAINER" caddy reload --config "$CADDY_CONF_CONT" --adapter caddyfile >/dev/null 2>&1; then
+      info "Caddy 容器已重载（$CADDY_CONTAINER）"; return 0
+    fi
+    if docker restart "$CADDY_CONTAINER" >/dev/null 2>&1; then
+      info "Caddy 容器已重启（$CADDY_CONTAINER）"; return 0
+    fi
+    warn "Caddy 容器重载失败，请手动检查： docker logs $CADDY_CONTAINER --tail 30"
+    return 0
+  fi
   if [[ -d /run/systemd/system ]] && systemctl list-unit-files --type=service 2>/dev/null | grep -q '^caddy\.service'; then
     systemctl enable caddy >/dev/null 2>&1 || true
     if systemctl is-active --quiet caddy; then
@@ -456,10 +611,14 @@ setup_caddy(){
   fi
 
   local hashp=""
-  hashp="$(caddy hash-password --plaintext "$CADDY_PLAIN" 2>/dev/null \
-        || printf '%s' "$CADDY_PLAIN" | caddy hash-password 2>/dev/null || true)"
+  hashp="$(caddy_hash "$CADDY_PLAIN" || true)"
   if [[ -z "$hashp" ]]; then
     warn "密码哈希生成失败 —— 管理面板将不设 Basic 认证，仅靠 management.secret-key 保护"
+  fi
+
+  local up; up="$(caddy_upstream)"
+  if [[ "$up" != "127.0.0.1" ]]; then
+    info "反代目标： $up:$API_PORT（Caddy 在容器里，不能用 127.0.0.1）"
   fi
 
   local start_marker='# >>> CLIProxyAPI START'
@@ -476,18 +635,18 @@ setup_caddy(){
   if [[ "${CERT_MODE:-cf}" == "cf" ]]; then
     # CF 橙云模式：443 用内部自签（CF 的 Full 模式不校验证书），80 兜底兼容 Flexible
     block="http://$CF_DOMAIN {
-${auth_block}    reverse_proxy 127.0.0.1:$API_PORT
+${auth_block}    reverse_proxy $up:$API_PORT
 }
 
 https://$CF_DOMAIN {
     tls internal
-${auth_block}    reverse_proxy 127.0.0.1:$API_PORT
+${auth_block}    reverse_proxy $up:$API_PORT
 }
 "
   else
     # Let's Encrypt：Caddy 自动签发（需 80/443 公网可达）
     block="$CF_DOMAIN {
-${auth_block}    reverse_proxy 127.0.0.1:$API_PORT
+${auth_block}    reverse_proxy $up:$API_PORT
 }
 "
   fi
@@ -513,7 +672,7 @@ open(site, "w").write(txt)
 print("Caddyfile %s: %s" % (action, site))
 PY
 
-  if ! caddy validate --config "$site" >/dev/null 2>&1; then
+  if ! caddy_validate "$site"; then
     err "Caddyfile 校验失败，正在回滚..."
     [[ -f "$site.cliproxy.bak" ]] && cp -f "$site.cliproxy.bak" "$site"
     err "已回滚。请手动检查 $site 是否有语法冲突"
@@ -643,6 +802,17 @@ do_install(){
   fi
 
   ask_credentials
+
+  # 先定下 Caddy 形态：它决定 8317 绑哪里、反代目标填什么地址
+  if [[ "$USE_CADDY" == "1" ]]; then
+    detect_caddy
+    case "${CADDY_MODE:-none}" in
+      docker) info "将复用 Docker 里的 Caddy 容器： $CADDY_CONTAINER" ;;
+      native) info "将复用宿主机 Caddy： $(command -v caddy)" ;;
+      *)      info "未发现 Caddy，稍后自动安装" ;;
+    esac
+  fi
+
   save_state
   write_config
 
@@ -721,7 +891,13 @@ do_status(){
   fi
 
   if [[ "${USE_CADDY:-0}" == "1" ]]; then
-    if [[ -d /run/systemd/system ]] && systemctl is-active --quiet caddy; then
+    if [[ "${CADDY_MODE:-}" == "docker" ]]; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CADDY_CONTAINER"; then
+        info "Caddy 容器运行中： $CADDY_CONTAINER（反代 → $(caddy_upstream):$API_PORT）"
+      else
+        warn "Caddy 容器 $CADDY_CONTAINER 未运行"
+      fi
+    elif [[ -d /run/systemd/system ]] && systemctl is-active --quiet caddy; then
       info "Caddy 运行中： $(caddy version 2>/dev/null | head -1)"
     else
       warn "Caddy 未作为 systemd 服务运行，重启机器后可能失效"
@@ -739,6 +915,9 @@ do_update(){
   load_state
   info "拉取最新镜像 $IMAGE ..."
   docker pull "$IMAGE" >/dev/null 2>&1 || warn "拉取失败，使用现有镜像"
+  if [[ "${USE_CADDY:-0}" == "1" ]]; then
+    detect_caddy
+  fi
   run_container
   if [[ "${USE_CADDY:-0}" == "1" && -n "$CF_DOMAIN" ]]; then
     setup_caddy || true
