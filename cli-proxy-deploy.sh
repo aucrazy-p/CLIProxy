@@ -33,6 +33,8 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="2026.10.19-r3"   # r3: Caddy 禁用 HTTP/3 绕开 UDP:443 冲突 + unit 幂等覆盖
+
 PERSIST_DIR="${PERSIST_DIR:-/opt/cliproxy}"
 API_PORT="${API_PORT:-8317}"
 CONFIG_FILE="$PERSIST_DIR/config.yaml"
@@ -680,6 +682,7 @@ do_install(){
   need_root "$@"
   need_python3
 
+  info "部署脚本版本： $SCRIPT_VERSION"
   mkdir -p "$PERSIST_DIR"/{auths,logs}
   load_state
 
