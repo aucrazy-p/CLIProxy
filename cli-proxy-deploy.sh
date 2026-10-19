@@ -353,7 +353,6 @@ wait_api(){
 
 # ---------- Caddy（官方静态二进制，无 Docker） ----------
 install_caddy_unit(){
-  [[ -f /etc/systemd/system/caddy.service ]] && return 0
   mkdir -p /etc/caddy
   [[ -f "$CADDYFILE_DEFAULT" ]] || : > "$CADDYFILE_DEFAULT"
   cat > /etc/systemd/system/caddy.service <<'UNIT'
@@ -544,6 +543,18 @@ try:
     txt = open(site).read()
 except FileNotFoundError:
     txt = ""
+# 确保禁用 HTTP/3(QUIC)：避免 caddy 去绑 UDP :443，与可能占用该端口的其它进程冲突
+# （Cloudflare 橙云场景下，客户端→CF 的 HTTP/3 由 CF 处理，源站只需 TCP h1/h2）
+need = "servers {\n\t\tprotocols h1 h2\n\t}"
+if "protocols h1 h2" not in txt:
+    m = re.search(r'^\s*\{\s*\n.*?\n\s*\}\s*\n', txt, re.S)
+    if m:
+        gb = m.group(0)
+        if "servers" not in gb:
+            inner = gb.strip()[1:-1].strip()
+            txt = txt[:m.start()] + "{\n\t" + inner + "\n\t" + need + "\n}\n" + txt[m.end():]
+    else:
+        txt = "{\n\t" + need + "\n}\n\n" + txt
 marker = sm + "\n" + block + em + "\n"
 pat = re.compile(re.escape(sm) + r".*?" + re.escape(em) + r"\n?", re.S)
 if pat.search(txt):
