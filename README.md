@@ -9,7 +9,6 @@
 - **Caddy 使用官方静态二进制安装**（不走 apt、不进容器），自动写 systemd 服务 + 开机自启；已有宿主机 Caddy 则直接复用
 - 缺 `python3` 自动安装（apt / dnf / yum / apk）
 - Caddyfile 用标记块插入，**不破坏你已有的其它站点**；写入前备份 + `caddy validate` 校验，失败自动回滚
-- 自动放行 GCP 防火墙（Cloudflare 场景默认仅放行 CF 回源段）
 - 凭据自动生成并落盘，装完打印全套
 
 ---
@@ -40,10 +39,9 @@ sudo bash /tmp/cpa.sh
 | ① | Cloudflare 域名 | 空 | 留空 = 直接用 `IP:8317`；填 `proxy.example.com` = 走域名 |
 | ② | 启用 Caddy 反代 | `1` | 想纯 IP 直连就填 `0`（非交互未指定时按 `0`） |
 | ③ | 证书方式 | `cf` | 仅启用 Caddy 时问：`cf`=内部自签（适配 CF 橙云）/ `le`=Let's Encrypt |
-| ④ | 防火墙仅放行 Cloudflare | `1` | 仅启用 Caddy 时问：填 `0` 则对全网开放 |
-| ⑤ | API 令牌 | 随机 | 客户端调接口填的 `api_key` |
-| ⑥ | 管理面板登录密钥 | 随机 | 后台登录用 |
-| ⑦ | Basic 认证密码 | 随机 | 仅启用 Caddy 时问，账号固定 `admin` |
+| ④ | API 令牌 | 随机 | 客户端调接口填的 `api_key` |
+| ⑤ | 管理面板登录密钥 | 随机 | 后台登录用 |
+| ⑥ | Basic 认证密码 | 随机 | 仅启用 Caddy 时问，账号固定 `admin` |
 
 **③ 选 `cf` 的原因**：Cloudflare 橙云（Proxied）后面做 HTTP-01 挑战经常失败，自签证书没有 ACME 挑战，且 CF `Full` 模式不校验它，浏览器看到的是 CF 的证书，终端无感知。**此时 CF 的 SSL/TLS 模式必须选 `Full`，不能选 `Full (strict)`**（strict 会校验自签证书报 526）。想走 `le`（Let's Encrypt）需要 80/443 公网可达且域名已解析到本机；灰云（DNS only）直连场景才建议用 `le`。
 
@@ -71,7 +69,6 @@ sudo API_TOKEN=mykey123456 \
 | `CF_DOMAIN` | 绑定域名；留空 = `IP:8317` 直连 | 空 |
 | `USE_CADDY` | 是否启用 Caddy 反代 | `0` |
 | `CERT_MODE` | `cf`=内部自签 / `le`=Let's Encrypt | `cf` |
-| `CF_IPS_ONLY` | 防火墙是否仅放行 CF 回源段 | `1` |
 | `CLI_VERSION` | CLIProxyAPI 版本（决定下载哪个 release） | `8.0.33` |
 | `API_PORT` | 服务端口 | `8317` |
 | `PERSIST_DIR` | 配置与登录态目录 | `/opt/cliproxy` |
@@ -157,17 +154,10 @@ curl -s https://proxy.example.com/v1/models \
 先 `status` 看健康检查是否 200，再看 `logs`（或 `journalctl -u cliproxy-api --tail 50`）。启用 Caddy 但域名解析还没生效时，Caddy 签证书会失败——等 DNS 生效后重跑 `install` 即可。
 
 **Cloudflare 报 526 / 521？**
-526 = CF 校验了自签证书，把 SSL/TLS 改成 `Full`（不是 strict）。521 = CF 连不上源站，检查防火墙是否放行了 80/443、Caddy 是否在跑。
+526 = CF 校验了自签证书，把 SSL/TLS 改成 `Full`（不是 strict）。521 = CF 连不上源站，检查 Caddy 是否运行、源站 80/443 端口是否可连通。
 
 **只开了橙云，但 8317 端口连不上？**
 正常。CF 免费版只代理固定端口（80/443/8080/8443/2052…），`8317` 不在列表。要么走域名 + Caddy 反代，要么把云朵点灰走 DNS only 直连。
-
-**只想自己用，不想暴露公网？**
-① 留空域名、② 填 `0`，然后只放行你家宽 IP：
-```bash
-gcloud compute firewall-rules create allow-cliproxy-8317 \
-  --allow=tcp:8317 --source-ranges=你的公网IP/32
-```
 
 **机器没有 systemd（如某些容器 / WSL1）？**
 Caddy 会退化成 `caddy start` 后台进程，机器重启后不会自动拉起，需重跑一次 `install`。CLIProxyAPI 依赖 systemd 起服务，建议在生产环境使用带 systemd 的发行版（Debian / Ubuntu 等）。
@@ -185,7 +175,6 @@ Caddy 会退化成 `caddy start` 后台进程，机器重启后不会自动拉�
 - Linux + root
 - `python3`（配置解析与 Caddyfile 写入）：缺失会自动安装（apt / dnf / yum / apk 依次尝试），装不上才报错退出。只读命令（`status`、`logs`）不依赖它
 - Caddy（可选，仅启用反代时）：自动安装官方静态二进制，已有宿主机 Caddy 则直接复用
-- `gcloud`（可选，仅在 GCP 上自动配防火墙；没有就打印手动放行命令）
 
 ---
 

@@ -15,14 +15,12 @@
 #    - 自动在 Caddyfile 中插入带标记的配置块（不破坏已有站点）
 #    - 写入前备份 + `caddy validate` 校验，校验失败自动回滚
 #    - 自动重载/启动 Caddy
-#    - 自动放行 GCP 防火墙，默认把来源收紧为 Cloudflare 回源段
 #
 #  网络模式（安装时交互选择，写入状态文件，update 自动复用）：
 #    ① 域名：留空 = 直接用 IP:8317；填写 = 走域名
 #    ② 反代：1 = 启用 Caddy 自动 HTTPS；0 = 不启用
 #    ③ 证书：cf = 内部自签(CF 橙云最稳，默认)；le = Let's Encrypt
-#    ④ 防火墙：1 = 仅放行 Cloudflare 回源段；0 = 全部放行
-#    ⑤⑥⑦ 凭据：回车自动生成随机值，也可自己指定
+#    ④⑤⑥ 凭据：回车自动生成随机值，也可自己指定
 #
 #  用法：
 #    bash cli-proxy-deploy.sh help       # 查看完整帮助
@@ -30,7 +28,7 @@
 #    子命令：   bash cli-proxy-deploy.sh install|start|stop|restart|status|logs|update|uninstall|menu
 #    非交互：
 #      API_TOKEN=xxx CF_DOMAIN=cliproxy.xxx.com USE_CADDY=1 CERT_MODE=cf \
-#      CF_IPS_ONLY=1 bash cli-proxy-deploy.sh install
+#      bash cli-proxy-deploy.sh install
 # =============================================================
 
 set -euo pipefail
@@ -57,7 +55,6 @@ CF_DOMAIN="${CF_DOMAIN:-}"
 GCP_PUBLIC_IP="${GCP_PUBLIC_IP:-}"
 USE_CADDY="${USE_CADDY:-0}"
 CERT_MODE="${CERT_MODE:-cf}"          # cf=内部自签 | le=Let's Encrypt
-CF_IPS_ONLY="${CF_IPS_ONLY:-1}"       # 1=防火墙只放行 Cloudflare 回源段
 
 # ---------- 通用工具 ----------
 # /dev/tty 存在不代表能打开（容器里常见），必须实测可读
@@ -107,7 +104,7 @@ ask_credential(){
 
 need_root(){
   if [[ "$(id -u)" != "0" ]]; then
-    err "本脚本需要 root 权限（会写 /opt、/etc/caddy、/usr/local/bin，并操作防火墙）"
+    err "本脚本需要 root 权限（会写 /opt、/etc/caddy、/usr/local/bin）"
     err "请改用： sudo bash $0 $*"
     exit 1
   fi
@@ -161,7 +158,6 @@ save_state(){
 CF_DOMAIN="$CF_DOMAIN"
 USE_CADDY="$USE_CADDY"
 CERT_MODE="$CERT_MODE"
-CF_IPS_ONLY="$CF_IPS_ONLY"
 CADDY_MODE="$CADDY_MODE"
 CADDY_PLAIN="$CADDY_PLAIN"
 CADDY_USER="$CADDY_USER"
@@ -256,10 +252,6 @@ show_info(){
       echo " 注意：使用内部自签证书 → Cloudflare SSL/TLS 模式须为 Full（不要选 Full strict）"
     fi
   fi
-  if [[ "${CF_IPS_ONLY:-0}" == "1" ]]; then
-    echo " 注意：防火墙仅放行 Cloudflare 回源段 → DNS 云朵须保持橙色(Proxied)"
-    echo "       若改成灰色(DNS only)，请求会被全部拦截，需重跑 install 并把第④项改为 0"
-  fi
   echo "---------------------------------------------------------"
   echo " 凭据文件: $STATE_FILE （权限 600，含本页全部明文凭据）"
   echo " 服务形态: CLIProxyAPI 原生 systemd 服务（无 Docker）"
@@ -347,91 +339,6 @@ wait_api(){
     sleep 1
   done
   warn "等待超时，请查看日志： journalctl -u cliproxy-api --tail 50"
-  return 0
-}
-
-# ---------- 防火墙 ----------
-cf_cidrs(){
-  local v4 v6 out=""
-  v4="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v4 2>/dev/null | grep -E '^[0-9]' | paste -sd, - || true)"
-  v6="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v6 2>/dev/null | grep -E '^[0-9a-fA-F]' | paste -sd, - || true)"
-  [[ -n "$v4" ]] && out="$v4"
-  [[ -n "$v6" ]] && out="${out:+$out,}$v6"
-  printf '%s' "$out"
-}
-
-firewall_src(){
-  local src="0.0.0.0/0" cf
-  if [[ "${CF_IPS_ONLY:-0}" == "1" && "${USE_CADDY:-0}" == "1" && -n "${CF_DOMAIN:-}" ]]; then
-    cf="$(cf_cidrs)"
-    if [[ -n "$cf" ]]; then
-      src="$cf"
-      info "防火墙来源已收紧为 Cloudflare 回源段（$(printf '%s' "$cf" | tr ',' '\n' | wc -l) 条）"
-    else
-      warn "Cloudflare IP 段拉取失败，退回 0.0.0.0/0（源站可能被直连绕开 CF）"
-    fi
-  fi
-  printf '%s' "$src"
-}
-
-gcp_allow(){
-  local p="$1"
-  local src="$2"
-  local rule="allow-cliproxy-$p"
-  if gcloud compute firewall-rules describe "$rule" >/dev/null 2>&1; then
-    if gcloud compute firewall-rules update "$rule" --source-ranges="$src" --rules="tcp:$p" >/dev/null 2>&1; then
-      info "防火墙规则 $rule 已更新"
-    else
-      warn "防火墙规则 $rule 更新失败，请手动检查"
-    fi
-  else
-    if gcloud compute firewall-rules create "$rule" --direction=INGRESS --priority=1000 \
-      --network=default --action=ALLOW --rules="tcp:$p" --source-ranges="$src" \
-      --description="CLIProxyAPI" >/dev/null 2>&1; then
-      info "已放行 tcp:$p"
-    else
-      warn "自动创建失败，请手动放行 tcp:$p"
-    fi
-  fi
-}
-
-check_default_rules(){
-  command -v gcloud >/dev/null 2>&1 || return 0
-  local r srcs a
-  for r in default-allow-http default-allow-https; do
-    gcloud compute firewall-rules describe "$r" >/dev/null 2>&1 || continue
-    srcs="$(gcloud compute firewall-rules describe "$r" --format='value(sourceRanges)' 2>/dev/null || true)"
-    [[ "$srcs" == *"0.0.0.0/0"* ]] || continue
-    warn "检测到 $r 仍对 0.0.0.0/0 开放，任何人可绕过 Cloudflare 直连源站"
-    a="$(_ask "   是否删除 $r ？[y/N]: ")"
-    if [[ "$a" == "y" || "$a" == "Y" ]]; then
-      gcloud compute firewall-rules delete "$r" --quiet >/dev/null 2>&1 \
-        && info "已删除 $r" || warn "删除失败，请手动在 GCP 控制台处理"
-    else
-      warn "已保留 $r —— 源站仍可被直连，请注意"
-    fi
-  done
-  return 0
-}
-
-do_firewall(){
-  if ! command -v gcloud >/dev/null 2>&1; then
-    if [[ "${USE_CADDY:-0}" == "1" ]]; then
-      warn "未检测到 gcloud，请手动放行 tcp:80,443（来源建议仅 Cloudflare IP 段）"
-    else
-      warn "未检测到 gcloud，请手动放行 tcp:$API_PORT"
-    fi
-    return 0
-  fi
-  local src
-  src="$(firewall_src)"
-  if [[ "${USE_CADDY:-0}" == "1" ]]; then
-    gcp_allow 80 "$src"
-    gcp_allow 443 "$src"
-    check_default_rules
-  else
-    gcp_allow "$API_PORT" "$src"
-  fi
   return 0
 }
 
@@ -754,13 +661,10 @@ do_install(){
       CERT_MODE="${v:-${CERT_MODE:-cf}}"
       [[ "$CERT_MODE" == "le" || "$CERT_MODE" == "cf" ]] || CERT_MODE=cf
 
-      v="$(_ask "④ 防火墙仅放行 Cloudflare 回源段?[1=是(推荐) 0=全部放行, 默认 ${CF_IPS_ONLY:-1}]: ")"
-      CF_IPS_ONLY="${v:-${CF_IPS_ONLY:-1}}"
     fi
   fi
 
   [[ "$USE_CADDY" == "1" ]] && USE_CADDY=1 || USE_CADDY=0
-  if [[ "${CF_IPS_ONLY:-1}" == "0" ]]; then CF_IPS_ONLY=0; else CF_IPS_ONLY=1; fi
 
   # 守卫：Caddy 需要域名才能提供有效证书
   if [[ "$USE_CADDY" == "1" && -z "$CF_DOMAIN" ]]; then
@@ -802,7 +706,6 @@ do_install(){
       wait_api
     fi
   fi
-  do_firewall
   save_state
   do_status
 }
@@ -950,7 +853,7 @@ CLIProxyAPI 一键部署脚本（原生二进制版 · 无 Docker）
 
 子命令:
   (无)        有终端时进入管理菜单，无终端时等同 install
-  install     安装或重建（下载二进制 / 写配置 / 起 systemd 服务 / 配 Caddy / 放行防火墙）
+  install     安装或重建（下载二进制 / 写配置 / 起 systemd 服务 / 配 Caddy）
   start       启动服务
   stop        停止服务
   restart     重启服务
@@ -968,7 +871,6 @@ CLIProxyAPI 一键部署脚本（原生二进制版 · 无 Docker）
   CF_DOMAIN=proxy.xxx.com  绑定域名；留空 = 直接用 IP:8317
   USE_CADDY=1|0            是否启用 Caddy 反代（默认 0）
   CERT_MODE=cf|le          cf=内部自签(适配 Cloudflare 橙云) | le=Let's Encrypt
-  CF_IPS_ONLY=1|0          防火墙是否只放行 Cloudflare 回源段
   CLI_VERSION=8.0.33       CLIProxyAPI 版本（决定下载哪个 release）
   API_PORT=8317            服务端口
   PERSIST_DIR=/opt/cliproxy 配置与登录态目录
