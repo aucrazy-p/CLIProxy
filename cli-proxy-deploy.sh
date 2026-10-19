@@ -447,6 +447,13 @@ restart_caddy(){
   local site="$1"
   # 以 unit 文件是否存在作为「走 systemd」的权威判断（比 list-unit-files 可靠）
   if [[ -f /etc/systemd/system/caddy.service ]]; then
+    # 若已有 caddy 进程但 systemd 并未托管它（旧版 caddy start 遗留的游离进程），
+    # 先清理，避免它占着 80/443 导致本次 systemd 启动因“地址已占用”而失败退出
+    if ! systemctl is-active --quiet caddy && pgrep -x caddy >/dev/null 2>&1; then
+      info "发现游离 caddy 进程，先清理以避免端口冲突"
+      pkill -x caddy 2>/dev/null || true
+      sleep 1
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable caddy >/dev/null 2>&1 || true
     if systemctl is-active --quiet caddy; then
