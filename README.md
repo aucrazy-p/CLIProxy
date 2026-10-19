@@ -1,33 +1,29 @@
-# CLIProxyAPI 一键部署脚本
+# CLIProxyAPI 一键部署脚本（无 Docker · 原生二进制版）
 
-在 Linux 服务器（Debian / Ubuntu 优先，其它发行版可用）上把 CLIProxyAPI 部署起来，用 Docker 跑，可选配 Caddy 反向代理 + HTTPS。
+在 Linux 服务器（Debian / Ubuntu 优先，其它发行版可用）上把 **CLIProxyAPI** 部署起来，对外暴露一个**标准 OpenAI 兼容接口**（默认 `8317` 端口），任何支持自定义 `base_url` 的客户端都能直接调用。
 
-它做的事情：把你已有的 AI 订阅账号授权给 CLIProxyAPI，由它对外暴露一个**标准 OpenAI 兼容接口**（默认 `8317` 端口），任何支持自定义 `base_url` 的客户端都能直接调用。
+**一条命令装完，中间只需回答几个问题，不需要手工改配置。**
 
-**一条命令装完，中间只需要回答几个问题，不需要手工改配置文件。**
-
-- 缺 Docker 自动装
-- Caddy 先探测再决定：**已有的（含 Docker 容器）直接复用**，没有才装
-- 缺 Caddy 自动装（apt 优先，失败降级官方静态二进制），自动写 systemd 服务并开机自启
-- 装之前先检查 80/443 是否被占用，被占则明确报错并回退，不会装出一个起不来的服务
-- Caddyfile 用标记块插入，**不会覆盖你已有的其它站点**
-- 写入前备份、写入后 `caddy validate` 校验，校验不过自动回滚并退回 IP 直连
-- 端口、令牌、密钥全部自动生成并落盘
-- 自动放行 GCP 防火墙（Cloudflare 场景默认只允许 CF 回源段）
-- 装完打印全套凭据，随时可用 `status` 再查一次
+本版已彻底去掉 Docker 依赖，最省内存：
+- **CLIProxyAPI 直接作为宿主机 systemd 服务运行**（二进制 `/usr/local/bin/CLIProxyAPI`），不拉镜像、不装 Docker 守护进程，零容器开销
+- **Caddy 使用官方静态二进制安装**（不走 apt、不进容器），自动写 systemd 服务 + 开机自启；已有宿主机 Caddy 则直接复用
+- 缺 `python3` 自动安装（apt / dnf / yum / apk）
+- Caddyfile 用标记块插入，**不破坏你已有的其它站点**；写入前备份 + `caddy validate` 校验，失败自动回滚
+- 自动放行 GCP 防火墙（Cloudflare 场景默认仅放行 CF 回源段）
+- 凭据自动生成并落盘，装完打印全套
 
 ---
 
-## 一键安装
+## 一、一键安装
 
 ```bash
 curl -fsSL -o /tmp/cpa.sh https://raw.githubusercontent.com/aucrazy-p/CLIProxy/main/cli-proxy-deploy.sh \
   && sudo bash /tmp/cpa.sh install
 ```
 
-> 不要写成 `curl ... | sudo bash`。管道会吞掉 tty，脚本的交互提问会被静默跳过、全部走默认值。
+> ⚠️ 不要写成 `curl ... | sudo bash`。管道会吞掉 tty，脚本的交互提问会被静默跳过、全部走默认值。
 
-下载下来跑菜单模式也可以（推荐首次使用）：
+第一次用也可以直接进菜单（推荐）：
 
 ```bash
 sudo bash /tmp/cpa.sh
@@ -35,148 +31,58 @@ sudo bash /tmp/cpa.sh
 
 ---
 
-## 安装时会问什么
+## 二、安装时会问什么
 
-只有 4 个网络选项 + 3 个凭据选项，**全部可以直接回车用默认值**。
+只有 **4 个网络项 + 3 个凭据项**，**全部可以直接回车用默认值**。
 
-| 序号 | 问题 | 默认 | 说明 |
+| # | 问题 | 默认 | 说明 |
 |---|---|---|---|
 | ① | Cloudflare 域名 | 空 | 留空 = 直接用 `IP:8317`；填 `proxy.example.com` = 走域名 |
-| ② | 启用 Caddy 反代 | `1` | 想纯 IP 直连就填 `0` |
-| ③ | 证书方式 | `cf` | `cf` = 内部自签（适配 Cloudflare 橙云）；`le` = Caddy 自动申请 Let's Encrypt |
-| ④ | 防火墙只放行 Cloudflare | `1` | 填 `0` 则对全网开放 |
-| ⑤ | API 令牌 | 随机 | 客户端填的 `api_key` |
+| ② | 启用 Caddy 反代 | `1` | 想纯 IP 直连就填 `0`（非交互未指定时按 `0`） |
+| ③ | 证书方式 | `cf` | 仅启用 Caddy 时问：`cf`=内部自签（适配 CF 橙云）/ `le`=Let's Encrypt |
+| ④ | 防火墙仅放行 Cloudflare | `1` | 仅启用 Caddy 时问：填 `0` 则对全网开放 |
+| ⑤ | API 令牌 | 随机 | 客户端调接口填的 `api_key` |
 | ⑥ | 管理面板登录密钥 | 随机 | 后台登录用 |
-| ⑦ | Basic 认证密码 | 随机 | 仅 Caddy 反代时出现，账号固定 `admin` |
+| ⑦ | Basic 认证密码 | 随机 | 仅启用 Caddy 时问，账号固定 `admin` |
 
-`③` 选 `cf` 的原因：Cloudflare 橙云（代理开启）后面做 HTTP-01 挑战经常失败，自签证书没有 ACME 挑战，CF 的 `Full` 模式也不校验它，浏览器看到的仍是 CF 的证书，用户端无感知。**此时 CF 的 SSL/TLS 模式必须是 `Full`，不能选 `Full (strict)`**，strict 会校验自签证书直接报 526。
+**③ 选 `cf` 的原因**：Cloudflare 橙云（Proxied）后面做 HTTP-01 挑战经常失败，自签证书没有 ACME 挑战，且 CF `Full` 模式不校验它，浏览器看到的是 CF 的证书，终端无感知。**此时 CF 的 SSL/TLS 模式必须选 `Full`，不能选 `Full (strict)`**（strict 会校验自签证书报 526）。想走 `le`（Let's Encrypt）需要 80/443 公网可达且域名已解析到本机；灰云（DNS only）直连场景才建议用 `le`。
 
----
-
-## 已有 Caddy 会不会重复装
-
-不会。脚本按这个顺序探测，**能复用就不装新的**：
-
-| 顺序 | 探测目标 | 命中后 |
-|---|---|---|
-| 1 | Docker 里正在跑的 Caddy 容器 | 复用：改它挂载的 Caddyfile，`docker exec` 校验并 reload |
-| 2 | 宿主机 `caddy` 二进制 | 复用：改 `/etc/caddy/Caddyfile`，走 systemd reload |
-| 3 | 都没有 | 安装（装前先检查 80/443 是否被占用） |
-
-### Docker 版复用需要注意的两件事
-
-**① 容器必须挂载了 Caddyfile。** 脚本靠 `docker inspect` 找挂载点，识别这两种写法：
-
-```bash
--v /opt/caddy/Caddyfile:/etc/caddy/Caddyfile   # 推荐
--v /opt/caddy:/etc/caddy                       # 也认，取其中的 Caddyfile
-```
-
-如果配置是打进镜像的（没挂载），脚本**不会**去动它——改了重启就丢，不如不碰。这种情况会提示你，然后回退到 IP 直连。
-
-**② 反代地址会自动换。** 容器里的 `127.0.0.1` 是容器自己，不是宿主机。所以脚本会：
-
-- 反代目标从 `127.0.0.1:8317` 自动换成 **docker0 网关**（通常是 `172.17.0.1:8317`）
-- 8317 也随之绑到这个网关地址而不是 `0.0.0.0`，公网依旧访问不到，只有本机容器能连
-
-如果 Caddy 容器用的是 `--network host`，则仍用 `127.0.0.1`，不做替换。
-
-> 复用的容器得自己已经发布了 80/443（`-p 80:80 -p 443:443`），否则 Cloudflare 过来的流量进不来——这属于你原容器的配置，脚本不去改。
-
-### 80/443 已被占用
-
-脚本会直接报错并列出占用者：
-
-```
-✗ 端口 80 已被占用，此时装 Caddy 会起不来
-LISTEN 0  511  0.0.0.0:80  0.0.0.0:*
-```
-
-此时要么释放端口，要么让占用方自己反代到 `127.0.0.1:8317`，脚本这边选①留空域名、②填 `0` 走 IP 直连即可。
+> 启用 Caddy 后，CLIProxyAPI 只绑 `127.0.0.1`（仅本机 Caddy 够得着，公网不可直连）；不启用 Caddy 时绑 `0.0.0.0` 直接对外。
 
 ---
 
-## 橙云还是灰云，证书怎么选
+## 三、非交互 / 脚本调用
 
-Cloudflare 云朵点成**橙色**（Proxied）时，浏览器拿到的永远是 CF 边缘证书，源站用什么证书终端用户根本看不到。这决定了 `CERT_MODE` 的正确选法：
-
-| 你的 DNS 记录 | 建议 `CERT_MODE` | 原因 |
-|---|---|---|
-| 橙云 | `cf`（自签，默认） | CF 的 `Full` 模式不校验证书；用户看的是 CF 边缘证书，源站用 LE 毫无收益 |
-| 橙云 + 要 `Full (strict)` | 改用 CF Origin CA | 后台一键生成、15 年有效，Caddy 直接 `tls` 加载，不碰 ACME |
-| 灰云（DNS only） | `le` | 浏览器直连源站，必须看到有效证书 |
-
-**橙云下别选 `le`**：CF 的 Always Use HTTPS 会把 `/.well-known/acme-challenge/` 一并重定向到 https，LE 的 HTTP-01 验证大概率失败。想强行用 LE 只能走 DNS-01，而官方 Caddy 不带 Cloudflare 插件、得用 xcaddy 自编译（1GB 内存的机器编译容易 OOM），换来的还是一个用户看不见的证书。
-
-### 切灰云的实际影响
-
-| 失去 | 得到 |
-|---|---|
-| CDN 缓存、DDoS 防护、WAF | 少一跳，延迟更低 |
-| 源站 IP 隐藏 | **没有 CF 免费版约 100 秒的 524 超时限制** |
-| 自动续期的边缘证书 | —— |
-
-对 API 代理类服务，请求通常很快，橙云的核心价值就是隐藏源站 IP。但如果常跑超过 100 秒的非流式长任务，灰云反而更稳。
-
-### 切灰云前必做的一件事
-
-安装时第④项选了 `1`（仅放行 Cloudflare 回源段）的话，**切灰云后所有请求都会被防火墙拦掉**——因为灰云下源 IP 是真实客户端，不再是 CF 的地址段。
-
-切之前重跑一次 `install`，把第④项改成 `0`（全部放行），或者事后手工调整 GCP 防火墙规则。脚本每次 `install` / `status` 也会打印这条提醒。
-
----
-
-## 凭据是怎么处理的
-
-三个凭据默认都是**安装时自动生成的 32 位随机串**（`openssl rand -hex 16`），也可以自己指定。它们互相独立，改一个不影响另一个。
-
-| 凭据 | 用途 | 存放位置 | 生成后还能看到明文吗 |
-|---|---|---|---|
-| `API_TOKEN` | 客户端调 `/v1/*` 时的 `Authorization: Bearer` | `config.yaml` 的 `access.api-keys` | 能，明文一直在 |
-| `MGMT_SECRET` | 管理面板 `management.html` 的登录密钥 | `config.yaml` 的 `management.secret-key`（启动后被 hash）；明文另存 `.deploy.env` | Caddyfile/config 里都看不到明文，去 `.deploy.env` 或 `status` 输出里找 |
-| `CADDY_PLAIN` | 浏览器访问后台时的 Basic 认证密码 | 明文只在 `.deploy.env`；Caddyfile 里是哈希 | 能，从 `.deploy.env` 读 |
-
-明文凭据统一落在 `/opt/cliproxy/.deploy.env`（权限 `600`，仅 root 可读），安装结束和每次 `status` 都会打印。
-
-**`MGMT_SECRET` 就是管理面板的登录密码。** 打开 `management.html`，输入框里要填的就是它。
-
-如果启用了 Caddy 反代，访问后台其实是**两层**：
-
-1. 浏览器先弹 Basic 认证框 → 账号 `admin`、密码 `CADDY_PLAIN`（Caddy 挡在门口）
-2. 通过后才看到 CLIProxyAPI 自己的登录页 → 输入 `MGMT_SECRET`
-
-两个密码互相独立，换一个不影响另一个。只从本机 `http://127.0.0.1:8317/management.html` 访问时没有第 1 层，直接输 `MGMT_SECRET`。
-
-### 三种指定方式
-
-**1. 安装时手输（推荐）**
-
-跑到 ⑤⑥⑦ 直接输入自己的值。只允许字母数字和 `. _ ~ : @ % + = / -`，长度 8–128；含空格、引号、`$` 之类的会拒绝并自动回退随机值（这些字符会把 YAML / Caddyfile 写坏）。
-
-**2. 非交互用环境变量**
+用环境变量一次性指定，无需回答问题：
 
 ```bash
 sudo API_TOKEN=mykey123456 \
      MGMT_SECRET=mysecret123456 \
-     CADDY_PLAIN=mybasic123456 \
      CF_DOMAIN=proxy.example.com \
      USE_CADDY=1 CERT_MODE=cf CF_IPS_ONLY=1 \
      bash cli-proxy-deploy.sh install
 ```
 
-**3. 装完之后再改**
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `API_TOKEN` | 客户端 `api_key`（不填自动生成） | 随机 |
+| `MGMT_SECRET` | 管理面板 `secret-key`（不填自动生成） | 随机 |
+| `CADDY_PLAIN` | 后台 Basic 认证密码（不填自动生成） | 随机 |
+| `CF_DOMAIN` | 绑定域名；留空 = `IP:8317` 直连 | 空 |
+| `USE_CADDY` | 是否启用 Caddy 反代 | `0` |
+| `CERT_MODE` | `cf`=内部自签 / `le`=Let's Encrypt | `cf` |
+| `CF_IPS_ONLY` | 防火墙是否仅放行 CF 回源段 | `1` |
+| `CLI_VERSION` | CLIProxyAPI 版本（决定下载哪个 release） | `8.0.33` |
+| `API_PORT` | 服务端口 | `8317` |
+| `PERSIST_DIR` | 配置与登录态目录 | `/opt/cliproxy` |
 
-- 改 `API_TOKEN`：编辑 `/opt/cliproxy/config.yaml` 的 `access.api-keys`，然后 `sudo bash cli-proxy-deploy.sh restart`
-- 改 `MGMT_SECRET`：编辑 `management.secret-key`（写明文），重启后会自动 hash。**务必先备份**，hash 之后无法还原
-- 改 Caddy Basic 密码：重跑 `install`，到第 ⑦ 项输入新密码即可（不输入则保持原密码）
-
-> 重复执行 `install` 不会重置已存在的 `config.yaml` 里的令牌与密钥；要彻底重来，先备份再删掉这个文件。
+重复执行 `install` 不会重置已存在的 `config.yaml` 里的令牌与密钥；要彻底重来，先备份再删掉该文件重跑。
 
 ---
 
-## 装好之后怎么用
+## 四、装好之后怎么用
 
-装完脚本会打印类似这样的信息：
+装完脚本会打印类似这样的信息（按你的选择不同，地址前缀会变）：
 
 ```
  当前模式：域名 + Caddy 反代 (HTTPS / TLS=cf)
@@ -188,7 +94,7 @@ sudo API_TOKEN=mykey123456 \
    后台 Basic 认证: admin / xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-**第一步：挂上你的账号**。打开管理面板，用 `secret-key` 登录，在里面完成 Gemini / Claude / Codex 等账号的 OAuth 授权。授权文件保存在 `/opt/cliproxy/auths/`，升级和重启容器都不会丢。
+**第一步：挂上你的账号**。打开管理面板，用 `secret-key` 登录，在里面完成 Gemini / Claude / Codex 等账号的 OAuth 授权。授权文件保存在 `/opt/cliproxy/auths/`，重启/更新都不会丢。
 
 **第二步：确认接口通**
 
@@ -197,89 +103,88 @@ curl -s https://proxy.example.com/v1/models \
   -H "Authorization: Bearer 你的API_TOKEN"
 ```
 
-返回的 `data[].id` 就是可用的模型名。
+返回的 `data[].id` 就是可用模型名。
 
 **第三步：在客户端里填**
-
-- `base_url`：填到 `/v1` 为止（脚本打印的就是这个），不要少了 `/v1`
+- `base_url`：填到 `/v1` 为止（脚本打印的就是这个），别漏 `/v1`
 - `api_key`：就是 `API_TOKEN`
 - `model`：用上一步拿到的模型名
 
+> 启用 Caddy 反代后访问后台是**两层**：先弹 Basic 认证框（`admin` / `CADDY_PLAIN`），通过后才到 CLIProxyAPI 登录页（输 `MGMT_SECRET`）。只从本机 `http://127.0.0.1:8317/management.html` 访问时没有第 1 层。
+
 ---
 
-## 常用命令
-
-脚本和容器都可以用子命令管理（`sudo` 需要）：
+## 五、常用命令
 
 | 命令 | 作用 |
 |---|---|
 | `sudo bash cli-proxy-deploy.sh` | 打开管理菜单 |
 | `sudo bash cli-proxy-deploy.sh install` | 安装 / 重建 / 改网络配置 |
 | `sudo bash cli-proxy-deploy.sh status` | 状态、可用模型、全套凭据 |
-| `sudo bash cli-proxy-deploy.sh logs` | 最近 100 行日志 |
-| `sudo bash cli-proxy-deploy.sh restart` | 重启容器 |
+| `sudo bash cli-proxy-deploy.sh logs` | 最近 100 行日志（`journalctl -u cliproxy-api`） |
+| `sudo bash cli-proxy-deploy.sh restart` | 重启服务 |
 | `sudo bash cli-proxy-deploy.sh stop` / `start` | 停止 / 启动 |
-| `sudo bash cli-proxy-deploy.sh update` | 拉最新镜像并重启（凭据与配置复用） |
-| `sudo bash cli-proxy-deploy.sh uninstall` | 移除容器（会问是否删配置目录） |
+| `sudo bash cli-proxy-deploy.sh update` | 重新下载最新二进制并重启（凭据与配置复用） |
+| `sudo bash cli-proxy-deploy.sh uninstall` | 移除服务（会问是否删配置目录） |
 | `bash cli-proxy-deploy.sh help` | 完整帮助 |
 
-底层等价于 `docker logs cli-proxy-api` / `docker restart cli-proxy-api`，直接敲 docker 命令也行。
+底层就是 systemd 操作：`systemctl start/stop/restart/status cliproxy-api`、`journalctl -u cliproxy-api`，直接敲也行。
 
 ---
 
-## 目录结构
+## 六、目录与文件
 
 ```
 /opt/cliproxy/
 ├── config.yaml        # 主配置（令牌、密钥、端口）
-├── .deploy.env        # 部署状态 + 明文凭据，600
-├── auths/             # OAuth 授权文件（挂载为容器内 /root/.cli-proxy-api）
-└── logs/              # 运行日志
-```
+├── .deploy.env        # 部署状态 + 明文凭据，权限 600
+├── auths/             # OAuth 授权文件
+└── logs/              # 运行日志（journald 不可用时的兜底）
 
-Caddy 配置在 `/etc/caddy/Caddyfile`，本脚本写入的部分被 `# >>> CLIProxyAPI START` 和 `# >>> CLIProxyAPI END` 包着，卸载时会精确移除这一段。
+/usr/local/bin/CLIProxyAPI       # CLIProxyAPI 二进制
+/usr/local/bin/caddy             # Caddy 二进制（仅启用反代时安装）
+/etc/caddy/Caddyfile             # Caddy 配置；本脚本写入部分被
+                                 #   # >>> CLIProxyAPI START / END 包着，卸载时精确移除
+/etc/systemd/system/cliproxy-api.service
+/etc/systemd/system/caddy.service
+```
 
 ---
 
-## 常见问题
+## 七、常见问题
 
 **装完访问不了？**
-先 `status` 看健康检查是否 200。再看 `logs`。如果启用了 Caddy 但域名解析还没生效，Caddy 签证书会失败——等 DNS 生效后重跑 `install` 即可。
+先 `status` 看健康检查是否 200，再看 `logs`（或 `journalctl -u cliproxy-api --tail 50`）。启用 Caddy 但域名解析还没生效时，Caddy 签证书会失败——等 DNS 生效后重跑 `install` 即可。
 
 **Cloudflare 报 526 / 521？**
 526 = CF 校验了自签证书，把 SSL/TLS 改成 `Full`（不是 strict）。521 = CF 连不上源站，检查防火墙是否放行了 80/443、Caddy 是否在跑。
 
 **只开了橙云，但 8317 端口连不上？**
-正常。CF 免费版只代理固定端口（80/443/8080/8443/2052…），`8317` 不在列表里。要么走域名 + Caddy 反代，要么把云朵点灰走 DNS only 直连。
+正常。CF 免费版只代理固定端口（80/443/8080/8443/2052…），`8317` 不在列表。要么走域名 + Caddy 反代，要么把云朵点灰走 DNS only 直连。
 
 **只想自己用，不想暴露公网？**
 ① 留空域名、② 填 `0`，然后只放行你家宽 IP：
-
 ```bash
 gcloud compute firewall-rules create allow-cliproxy-8317 \
   --allow=tcp:8317 --source-ranges=你的公网IP/32
 ```
 
-**Caddy 装在非 systemd 环境的容器里？**
-脚本会退化成 `caddy start` 后台进程，机器重启后不会自动拉起来，需要重跑一次 `install`。
+**机器没有 systemd（如某些容器 / WSL1）？**
+Caddy 会退化成 `caddy start` 后台进程，机器重启后不会自动拉起，需重跑一次 `install`。CLIProxyAPI 依赖 systemd 起服务，建议在生产环境使用带 systemd 的发行版（Debian / Ubuntu 等）。
 
-**VPS 上已经有 Docker 版 Caddy，会不会被重复装一个？**
-不会。脚本先找容器，找到且挂了 Caddyfile 就直接复用，不会装第二个——两个 Caddy 抢 80/443 会直接起不来。容器没挂 Caddyfile 时它会提示并回退 IP 直连，不会悄悄改镜像内的配置。详见上文「已有 Caddy 会不会重复装」。
-
-**卸载会不会连 Caddy 一起删？**
-不会。Caddy 可能还跑着别的站点，只清理本脚本写入的配置块。确实要卸载 Caddy：`apt remove caddy`。
+**卸载会连 Caddy 一起删吗？**
+不会。只清理本脚本写入的 Caddyfile 配置块，Caddy 本体（二进制 + systemd 服务）保留，因为它可能还跑着别的站点。要彻底卸载 Caddy：`rm -f /usr/local/bin/caddy /etc/systemd/system/caddy.service`。
 
 **要换 VPS 怎么办？**
 把 `/opt/cliproxy` 整个目录拷到新机器，在新机器执行 `install`，域名解析改到新 IP 即可，授权不用重新做。
 
 ---
 
-## 依赖
+## 八、依赖
 
 - Linux + root
-- `python3`（配置解析与 Caddyfile 写入）：**缺失会自动安装**（apt / dnf / yum / apk 依次尝试），装不上才报错退出。只读命令（`status`、`logs`）不依赖它
-- Docker（缺失自动安装）
-- Caddy（可选，仅启用反代时需要）：已有的直接复用（宿主机二进制或 Docker 容器都算），没有才自动安装
+- `python3`（配置解析与 Caddyfile 写入）：缺失会自动安装（apt / dnf / yum / apk 依次尝试），装不上才报错退出。只读命令（`status`、`logs`）不依赖它
+- Caddy（可选，仅启用反代时）：自动安装官方静态二进制，已有宿主机 Caddy 则直接复用
 - `gcloud`（可选，仅在 GCP 上自动配防火墙；没有就打印手动放行命令）
 
 ---
