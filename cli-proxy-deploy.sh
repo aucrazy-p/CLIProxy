@@ -364,9 +364,11 @@ After=network.target network-online.target
 Requires=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+Restart=on-failure
+RestartSec=5
 TimeoutStopSec=5s
 LimitNOFILE=1048576
 PrivateTmp=true
@@ -460,7 +462,13 @@ restart_caddy(){
       systemctl reload caddy 2>/dev/null && { info "Caddy 已重载"; return 0; }
       systemctl restart caddy 2>/dev/null && { info "Caddy 已重启"; return 0; }
     else
-      systemctl start caddy 2>/dev/null && { info "Caddy 已启动"; return 0; }
+      if systemctl start caddy 2>/dev/null; then
+        if systemctl is-active --quiet caddy; then
+          info "Caddy 已启动"; return 0
+        else
+          warn "systemd 启动 Caddy 失败（进程可能崩溃），查看： journalctl -u caddy -n 30 --no-pager"
+        fi
+      fi
     fi
   fi
   caddy reload --config "$site" 2>/dev/null && { info "Caddy 已重载(无 systemd)"; return 0; }
