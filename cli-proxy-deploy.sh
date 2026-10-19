@@ -510,7 +510,7 @@ setup_caddy(){
   local auth_block="" block=""
 
   if [[ -n "$hashp" ]]; then
-    auth_block="    basicauth /management.html {
+    auth_block="    basic_auth /management.html {
         $CADDY_USER $hashp
     }
 "
