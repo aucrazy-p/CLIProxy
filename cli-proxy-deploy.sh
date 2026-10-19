@@ -319,9 +319,18 @@ UNIT
 
 svc_cliproxy(){
   local act="$1"
-  if ! systemctl list-unit-files --type=service 2>/dev/null | grep -q '^cliproxy-api\.service'; then
+  # 以 unit 文件是否真实存在于磁盘作为「已安装」的权威判断（比 list-unit-files 可靠）
+  if [[ ! -f "$CLI_UNIT" ]]; then
+    # 文件不存在，但进程可能以非 systemd 方式在跑（极端情况），stop 时兜底杀掉
+    if [[ "$act" == "stop" ]] && pgrep -f "$CLI_BIN" >/dev/null 2>&1; then
+      pkill -f "$CLI_BIN" >/dev/null 2>&1 && { info "已停止（非 systemd 进程）"; return 0; }
+    fi
     err "服务 cliproxy-api 未安装，请先执行 install"
     return 1
+  fi
+  # unit 文件在，但 systemd 可能尚未加载（首次安装后），补一次 reload 再操作
+  if ! systemctl is-active --quiet cliproxy-api 2>/dev/null; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   systemctl "$act" cliproxy-api >/dev/null 2>&1 && return 0 || return 1
 }
@@ -391,6 +400,7 @@ caddy_hash(){
 ensure_caddy(){
   detect_caddy
   if [[ "${CADDY_MODE:-none}" == "native" ]]; then
+    install_caddy_unit   # 即便二进制已就绪，也确保 systemd 单元存在（避免回退到 caddy start）
     info "已检测到 Caddy： $(command -v caddy)  $(caddy version 2>/dev/null | head -1)"
     return 0
   fi
@@ -435,7 +445,9 @@ caddy_conf_path(){
 
 restart_caddy(){
   local site="$1"
-  if [[ -d /run/systemd/system ]] && systemctl list-unit-files --type=service 2>/dev/null | grep -q '^caddy\.service'; then
+  # 以 unit 文件是否存在作为「走 systemd」的权威判断（比 list-unit-files 可靠）
+  if [[ -f /etc/systemd/system/caddy.service ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable caddy >/dev/null 2>&1 || true
     if systemctl is-active --quiet caddy; then
       systemctl reload caddy 2>/dev/null && { info "Caddy 已重载"; return 0; }
@@ -692,7 +704,12 @@ do_install(){
   # 安装并启动 CLIProxyAPI（原生二进制 + systemd，无 Docker）
   download_cliproxy_binary || exit 1
   install_cliproxy_unit
+  systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable --now cliproxy-api >/dev/null 2>&1 || true
+  if ! systemctl is-active --quiet cliproxy-api 2>/dev/null; then
+    warn "systemd 启动未立即生效，重试一次 start"
+    systemctl start cliproxy-api >/dev/null 2>&1 || true
+  fi
   wait_api
 
   if [[ "$USE_CADDY" == "1" ]]; then
@@ -758,7 +775,7 @@ do_status(){
 }
 
 do_logs(){
-  if [[ -d /run/systemd/system ]] && systemctl list-unit-files --type=service 2>/dev/null | grep -q '^cliproxy-api\.service'; then
+  if [[ -f "$CLI_UNIT" ]]; then
     journalctl -u cliproxy-api -n 100 --no-pager 2>&1 || warn "无日志（可能尚未运行）"
   else
     warn "未以 systemd 安装，日志路径： $PERSIST_DIR/logs"
