@@ -2,8 +2,9 @@
 # =============================================================
 #  CLIProxyAPI 一键部署脚本（全自动版）
 # -------------------------------------------------------------
-#  作用：把 Gemini / Claude / Codex / Kimi 等订阅额度包装成
-#        OpenAI 兼容 API(端口 8317)，供 legado_NG 分镜调用
+#  作用：在 Linux 服务器上以 Docker 方式部署 CLIProxyAPI，
+#        把已有订阅账号的额度统一包装成标准 OpenAI 兼容 API
+#        （默认监听 8317，可被任意支持自定义 base_url 的客户端调用）
 #
 #  本版自动化范围（无需任何手工步骤）：
 #    - 自动安装缺失的 Docker
@@ -18,8 +19,11 @@
 #    ① 域名：留空 = 直接用 IP:8317；填写 = 走域名
 #    ② 反代：1 = 启用 Caddy 自动 HTTPS；0 = 不启用
 #    ③ 证书：cf = 内部自签(CF 橙云最稳，默认)；le = Let's Encrypt
+#    ④ 防火墙：1 = 仅放行 Cloudflare 回源段；0 = 全部放行
+#    ⑤⑥⑦ 凭据：回车自动生成随机值，也可自己指定
 #
 #  用法：
+#    bash cli-proxy-deploy.sh help       # 查看完整帮助
 #    交互菜单： bash cli-proxy-deploy.sh
 #    子命令：   bash cli-proxy-deploy.sh install|start|stop|restart|status|logs|update|uninstall|menu
 #    非交互：
@@ -74,6 +78,27 @@ gen_rand(){
     || echo "$(date +%s)-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' ')"
 }
 
+# 只允许可直接写进 YAML / Caddyfile 的字符，避免引号、空格、$ 把配置写坏
+valid_key(){ [[ "${1:-}" =~ ^[A-Za-z0-9._~:@%+=/-]{8,128}$ ]]; }
+
+# 交互录入凭据：回车=保留/随机生成；非法输入=退回随机值
+# 用法: ask_credential "提示" 变量名 "预设值"
+ask_credential(){
+  local prompt="$1" name="$2" preset="${3:-}" v
+  v="$(_ask "$prompt")"
+  if [[ -z "$v" ]]; then
+    printf -v "$name" '%s' "${preset:-$(gen_rand)}"
+    return 0
+  fi
+  if ! valid_key "$v"; then
+    warn "输入不合法（仅允许字母数字与 . _ ~ : @ % + = / -，长度 8-128），已忽略该输入"
+    printf -v "$name" '%s' "${preset:-$(gen_rand)}"
+    return 0
+  fi
+  printf -v "$name" '%s' "$v"
+  return 0
+}
+
 need_root(){
   if [[ "$(id -u)" != "0" ]]; then
     err "本脚本需要 root 权限（会写 /opt、/etc/caddy、/usr/local/bin，并操作防火墙）"
@@ -93,7 +118,10 @@ need_python3(){
 # ---------- 状态持久化 ----------
 save_state(){
   mkdir -p "$PERSIST_DIR"
-  cat > "$STATE_FILE" <<EOF
+  # umask 077：文件从创建那一刻起就只有 root 可读，避免出现短暂的 644 窗口
+  (
+    umask 077
+    cat > "$STATE_FILE" <<EOF
 CF_DOMAIN="$CF_DOMAIN"
 USE_CADDY="$USE_CADDY"
 CERT_MODE="$CERT_MODE"
@@ -103,6 +131,7 @@ CADDY_USER="$CADDY_USER"
 API_TOKEN="$API_TOKEN"
 MGMT_SECRET="$MGMT_SECRET"
 EOF
+  )
   chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
@@ -165,10 +194,10 @@ show_info(){
   echo
   echo "========================================================="
   echo " 当前模式：$mode"
-  echo " legado_NG 『AI 分镜』引擎 → 『服务地址』填写："
+  echo " OpenAI 兼容 API（客户端填写）："
   echo "   base_url: $addr"
   echo "   api_key:  ${API_TOKEN:-（见 $CONFIG_FILE 的 access.api-keys）}"
-  echo "   model:    以管理面板模型列表为准"
+  echo "   model:    先用 GET $addr/models 获取列表，再任选其一"
   echo "---------------------------------------------------------"
   echo " 管理面板: $panel"
   echo "   登录密钥(secret-key): ${MGMT_SECRET:-（见 $STATE_FILE）}"
@@ -178,6 +207,8 @@ show_info(){
       echo " 注意：使用内部自签证书 → Cloudflare SSL/TLS 模式须为 Full（不要选 Full strict）"
     fi
   fi
+  echo "---------------------------------------------------------"
+  echo " 凭据文件: $STATE_FILE （权限 600，含本页全部明文凭据）"
   echo "========================================================="
 }
 
@@ -200,7 +231,7 @@ ensure_docker(){
 
 run_container(){
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  local mgmt_map="" baddr
+  local mgmt_map="" baddr p
   baddr="$(bind_addr)"
   for p in "${MGMT_PORTS[@]}"; do mgmt_map="$mgmt_map -p 127.0.0.1:$p:$p"; done
   # shellcheck disable=SC2086
@@ -255,7 +286,9 @@ firewall_src(){
 }
 
 gcp_allow(){
-  local p="$1" src="$2" rule="allow-cliproxy-$p"
+  local p="$1"
+  local src="$2"
+  local rule="allow-cliproxy-$p"
   if gcloud compute firewall-rules describe "$rule" >/dev/null 2>&1; then
     if gcloud compute firewall-rules update "$rule" --source-ranges="$src" --rules="tcp:$p" >/dev/null 2>&1; then
       info "防火墙规则 $rule 已更新"
@@ -546,8 +579,29 @@ access:
   api-keys:
     - "$API_TOKEN"
 EOF
-    info "已写入 $CONFIG_FILE（令牌已自动生成，覆盖出厂默认密钥）"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    info "已写入 $CONFIG_FILE"
   fi
+}
+
+# 凭据：新建 config 时可自定义 token / secret；Caddy 密码每次都可由 state 复用或重设
+ask_credentials(){
+  have_tty || return 0
+  echo
+  echo "---- 凭据设置（直接回车 = 保持现有值 / 自动生成）----"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    info "已存在 $CONFIG_FILE，API 令牌与登录密钥保持不变"
+    info "  如需更换：编辑该文件的 access.api-keys / management.secret-key 后执行 restart"
+  else
+    ask_credential "⑤ API 令牌(客户端填的 api_key)[回车=随机生成]: " API_TOKEN "${API_TOKEN:-}"
+    ask_credential "⑥ 管理面板登录密钥(secret-key)[回车=随机生成]: " MGMT_SECRET "${MGMT_SECRET:-}"
+  fi
+  if [[ "${USE_CADDY:-0}" == "1" ]]; then
+    local hint="随机生成"
+    if [[ -n "${CADDY_PLAIN:-}" ]]; then hint="保持现有"; fi
+    ask_credential "⑦ 管理面板 Basic 认证密码(账号 $CADDY_USER)[回车=$hint]: " CADDY_PLAIN "${CADDY_PLAIN:-}"
+  fi
+  return 0
 }
 
 do_install(){
@@ -558,9 +612,7 @@ do_install(){
   mkdir -p "$PERSIST_DIR"/{auths,logs}
   load_state
 
-  write_config
-
-  # ---------- 交互选择 ----------
+  # ---------- 交互选择（必须在写 config 之前，凭据要在这里定下来）----------
   if have_tty; then
     echo
     echo "---- 网络模式选择（直接回车 = 用括号内默认值）----"
@@ -589,7 +641,10 @@ do_install(){
     warn "Caddy 需要域名才能提供有效证书，已退回『IP 直连』模式"
     USE_CADDY=0
   fi
+
+  ask_credentials
   save_state
+  write_config
 
   if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     if port_in_use "$API_PORT"; then
@@ -749,6 +804,44 @@ show_menu(){
 }
 
 # ---------- 入口 ----------
+usage(){
+  cat <<'EOF'
+CLIProxyAPI 一键部署脚本
+
+用法:
+  bash cli-proxy-deploy.sh [子命令]
+
+子命令:
+  (无)        有终端时进入管理菜单，无终端时等同 install
+  install     安装或重建（自动装 Docker / 写配置 / 起容器 / 配 Caddy / 放行防火墙）
+  start       启动容器
+  stop        停止容器
+  restart     重启容器
+  status      查看状态、可用模型与全部凭据
+  logs        查看最近 100 行日志
+  update      拉取最新镜像并重启（复用已有凭据与网络模式）
+  uninstall   卸载容器（可选是否删除配置目录）
+  menu        进入管理菜单
+  help        显示本帮助
+
+非交互安装（CI / 脚本调用），可用环境变量覆盖:
+  API_TOKEN=xxx            客户端使用的 api_key（不填自动生成）
+  MGMT_SECRET=xxx          管理面板 secret-key（不填自动生成）
+  CADDY_PLAIN=xxx          管理面板 Basic 认证密码（不填自动生成）
+  CF_DOMAIN=proxy.xxx.com  绑定域名；留空 = 直接用 IP:8317
+  USE_CADDY=1|0            是否启用 Caddy 反代（默认 0）
+  CERT_MODE=cf|le          cf=内部自签(适配 Cloudflare 橙云) | le=Let's Encrypt
+  CF_IPS_ONLY=1|0          防火墙是否只放行 Cloudflare 回源段
+  API_PORT=8317            服务端口
+  PERSIST_DIR=/opt/cliproxy 配置与登录态目录
+
+示例:
+  sudo bash cli-proxy-deploy.sh install
+  sudo API_TOKEN=mykey12345 CF_DOMAIN=proxy.example.com USE_CADDY=1 \
+       bash cli-proxy-deploy.sh install
+EOF
+}
+
 case "${1:-}" in
   install)   do_install ;;
   start)     do_start ;;
@@ -759,12 +852,13 @@ case "${1:-}" in
   update)    do_update ;;
   uninstall) do_uninstall ;;
   menu)      show_menu ;;
+  help|-h|--help) usage ;;
   "")
     if have_tty; then show_menu; else do_install; fi
     ;;
   *)
     warn "未知参数: $1"
-    echo "用法: $0 [install|start|stop|restart|status|logs|update|uninstall|menu]"
+    usage
     exit 1
     ;;
 esac
