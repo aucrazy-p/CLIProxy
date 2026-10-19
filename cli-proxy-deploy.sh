@@ -114,11 +114,29 @@ need_root(){
 }
 
 need_python3(){
-  command -v python3 >/dev/null 2>&1 || {
-    err "缺少 python3（用于解析配置与写入 Caddyfile）"
-    err "请先安装： apt-get update && apt-get install -y python3"
+  command -v python3 >/dev/null 2>&1 && return 0
+
+  warn "未检测到 python3（用于解析配置与安全写入 Caddyfile），开始自动安装..."
+  if command -v apt-get >/dev/null 2>&1; then
+    # 先直接装（多数机器索引已就绪），失败再 update 重试
+    apt-get install -y --no-install-recommends python3 >/dev/null 2>&1 || {
+      apt-get update -qq >/dev/null 2>&1 || true
+      apt-get install -y --no-install-recommends python3 >/dev/null 2>&1 || true
+    }
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3 >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y python3 >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache python3 >/dev/null 2>&1 || true
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    err "python3 自动安装失败（包管理器不可用或网络受限）"
+    err "请手动执行后重跑： apt-get update && apt-get install -y python3"
     exit 1
-  }
+  fi
+  info "python3 已安装： $(python3 --version 2>&1)"
 }
 
 # ---------- 状态持久化 ----------
@@ -155,7 +173,14 @@ load_state(){
 
 load_token(){
   if [[ -z "${API_TOKEN:-}" && -f "$CONFIG_FILE" ]]; then
-    API_TOKEN=$(python3 -c "import re;m=re.search(r'api-keys:\s*\n\s*-\s*\"([^\"]+)\"', open('$CONFIG_FILE').read());print(m.group(1) if m else '')" 2>/dev/null || true)
+    # 纯 awk 解析，不依赖 python3（status / logs 等只读命令可能在未装 python3 时先跑）
+    API_TOKEN=$(awk '
+      /^[[:space:]]*api-keys:[[:space:]]*$/ { inlist = 1; next }
+      inlist && /^[[:space:]]*-[[:space:]]*"/ {
+        sub(/^[[:space:]]*-[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+      }
+      inlist && /^[^[:space:]-]/ { exit }
+    ' "$CONFIG_FILE" 2>/dev/null || true)
   fi
   return 0
 }
@@ -246,6 +271,10 @@ show_info(){
     if [[ "$CERT_MODE" == "cf" ]]; then
       echo " 注意：使用内部自签证书 → Cloudflare SSL/TLS 模式须为 Full（不要选 Full strict）"
     fi
+  fi
+  if [[ "${CF_IPS_ONLY:-0}" == "1" ]]; then
+    echo " 注意：防火墙仅放行 Cloudflare 回源段 → DNS 云朵须保持橙色(Proxied)"
+    echo "       若改成灰色(DNS only)，请求会被全部拦截，需重跑 install 并把第④项改为 0"
   fi
   echo "---------------------------------------------------------"
   echo " 凭据文件: $STATE_FILE （权限 600，含本页全部明文凭据）"
@@ -716,7 +745,17 @@ write_config(){
     info "已有 config.yaml，保留原密钥，仅修正 allow-remote=true"
     load_token
     if [[ -z "${MGMT_SECRET:-}" ]]; then
-      MGMT_SECRET="$(python3 -c "import re;m=re.search(r'secret-key:\s*\"([^\"]*)\"', open('$CONFIG_FILE').read());print(m.group(1) if m else '')" 2>/dev/null || true)"
+      # 兼容两种写法：带引号的明文，以及 CLIProxyAPI 回写的无引号 bcrypt 哈希
+      MGMT_SECRET="$(awk '
+        /^[[:space:]]*secret-key:/ {
+          if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+          s = $0
+          sub(/^[[:space:]]*secret-key:[[:space:]]*/, "", s)
+          sub(/[[:space:]]*#.*$/, "", s)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+          print s; exit
+        }
+      ' "$CONFIG_FILE" 2>/dev/null || true)"
     fi
     if [[ "${MGMT_SECRET:0:2}" == '$2' ]]; then
       warn "config 中 secret-key 已是 bcrypt 哈希，明文无法还原"
