@@ -453,8 +453,8 @@ restart_caddy(){
     # 先清理，避免它占着 80/443 导致本次 systemd 启动因“地址已占用”而失败退出
     if ! systemctl is-active --quiet caddy && pgrep -x caddy >/dev/null 2>&1; then
       info "发现游离 caddy 进程，先清理以避免端口冲突"
-      pkill -x caddy 2>/dev/null || true
-      sleep 1
+      pkill -9 -x caddy 2>/dev/null || true
+      sleep 2
     fi
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable caddy >/dev/null 2>&1 || true
